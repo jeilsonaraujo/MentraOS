@@ -2,6 +2,7 @@ package com.mentra.asg_client.camera.policy;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import android.hardware.camera2.CaptureResult;
 import android.media.MediaRecorder;
 
 import com.mentra.asg_client.settings.VideoSettings;
@@ -40,6 +41,32 @@ public class VideoRecorderPolicyTest {
     @Test
     public void recorderSurfaceWarmup_preservesHistoricalDelay() {
         assertThat(VideoRecorderPolicy.RECORDER_SURFACE_WARMUP_MS).isEqualTo(900);
+    }
+
+    @Test
+    public void aeConvergeTimeout_isCeilingAboveWarmupFloor() {
+        assertThat(VideoRecorderPolicy.AE_CONVERGE_TIMEOUT_MS).isEqualTo(3000);
+        assertThat(VideoRecorderPolicy.AE_CONVERGE_TIMEOUT_MS)
+                .isGreaterThan(VideoRecorderPolicy.RECORDER_SURFACE_WARMUP_MS);
+    }
+
+    @Test
+    public void isAeReadyForRecording_readyStates() {
+        assertThat(VideoRecorderPolicy.isAeReadyForRecording(CaptureResult.CONTROL_AE_STATE_CONVERGED)).isTrue();
+        assertThat(VideoRecorderPolicy.isAeReadyForRecording(CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED)).isTrue();
+        assertThat(VideoRecorderPolicy.isAeReadyForRecording(CaptureResult.CONTROL_AE_STATE_LOCKED)).isTrue();
+    }
+
+    @Test
+    public void isAeReadyForRecording_notReadyStates() {
+        assertThat(VideoRecorderPolicy.isAeReadyForRecording(CaptureResult.CONTROL_AE_STATE_INACTIVE)).isFalse();
+        assertThat(VideoRecorderPolicy.isAeReadyForRecording(CaptureResult.CONTROL_AE_STATE_SEARCHING)).isFalse();
+        assertThat(VideoRecorderPolicy.isAeReadyForRecording(CaptureResult.CONTROL_AE_STATE_PRECAPTURE)).isFalse();
+    }
+
+    @Test
+    public void isAeReadyForRecording_nullIsNotReady() {
+        assertThat(VideoRecorderPolicy.isAeReadyForRecording(null)).isFalse();
     }
 
     @Test
