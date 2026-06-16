@@ -1275,9 +1275,25 @@ public final class MentraBluetoothSDK {
     }
 
     private func handleVideoRecordingStatusForRequests(_ event: VideoRecordingStatusEvent) {
-        guard let request = pendingVideoRecordingRequests[event.requestId] else { return }
+        // The glasses' video_recording_status events don't carry a requestId, so
+        // keying off event.requestId (it's empty) always misses — the pending
+        // command never resolves, times out, and its requestId stays locked. At
+        // most one video-recording command is in flight, so fall back to matching
+        // the pending request by its expected status (treating `already_recording`
+        // as a successful `recording_started`).
+        let matched: PendingVideoRecordingRequest?
+        if !event.requestId.isEmpty, let byId = pendingVideoRecordingRequests[event.requestId] {
+            matched = byId
+        } else {
+            matched = pendingVideoRecordingRequests.values.first { pending in
+                pending.expectedStatus == event.status
+                    || (pending.expectedStatus == "recording_started" && event.status == "already_recording")
+            }
+        }
+        guard let request = matched else { return }
         if event.success {
-            if event.status == request.expectedStatus {
+            if event.status == request.expectedStatus
+                || (request.expectedStatus == "recording_started" && event.status == "already_recording") {
                 if request.waitForUpload {
                     request.stoppedEvent = event
                     if request.uploadSucceeded {

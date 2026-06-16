@@ -4,8 +4,11 @@ import android.content.Context;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
 import android.media.MediaRecorder;
 import android.os.Handler;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.Size;
 import android.view.Surface;
@@ -79,6 +82,10 @@ public final class VideoRecordingSession {
     private VideoSettings pendingSettings;
     private long recordingStartTime;
     private Timer recordingTimer;
+    /** Guards {@link #beginRecorderStart}: the AE gate fires per-frame and the timeout may also fire. */
+    private boolean recorderStarted;
+    /** elapsedRealtime() when the preview repeating request started, to enforce the warmup floor. */
+    private long previewStartElapsedMs;
 
     public VideoRecordingSession(Context context,
                                  Handler backgroundHandler,
@@ -222,8 +229,16 @@ public final class VideoRecordingSession {
     }
 
     /**
-     * Begin the repeating preview request, wait the configured warmup delay, then start the
-     * encoder + IMU + progress timer. Mirrors the historical {@code startRecordingInternal}.
+     * Begin the repeating preview request, then start the encoder once the sensor is actually
+     * exposing real frames — gated on auto-exposure (AE) convergence instead of a flat delay.
+     *
+     * <p>A cold camera (first recording after the HAL was opened fresh) takes longer than the old
+     * flat 900 ms to expose, which produced a black first video; a warm camera converges quickly.
+     * So we wait for {@link VideoRecorderPolicy#isAeReadyForRecording(Integer)} but never sooner
+     * than {@link VideoRecorderPolicy#RECORDER_SURFACE_WARMUP_MS} (A/V-sync floor) and never later
+     * than {@link VideoRecorderPolicy#AE_CONVERGE_TIMEOUT_MS} (so capture can't hang). The AE
+     * callback and the timeout both run on {@code backgroundHandler}, so {@link #beginRecorderStart}
+     * is single-threaded and a plain boolean dedupes the one-shot start.
      */
     public void startRecording(CameraCaptureSession session, CaptureRequest.Builder previewBuilder)
             throws CameraAccessException {
@@ -231,64 +246,91 @@ public final class VideoRecordingSession {
             notifyError(currentVideoId, "Cannot start recording, camera not ready.");
             return;
         }
-        session.setRepeatingRequest(previewBuilder.build(), null, backgroundHandler);
+        recorderStarted = false;
+        previewStartElapsedMs = SystemClock.elapsedRealtime();
 
-        backgroundHandler.postDelayed(() -> {
-            try {
-                if (recorderSurface == null || !recorderSurface.isValid()) {
-                    Log.e(TAG, "Camera not ready for recording - surface invalid");
-                    notifyError(currentVideoId, "Camera not ready for recording");
-                    return;
-                }
-
-                mediaRecorder.start();
-                // Anchor for the video timeline on the IMU clock (elapsedRealtimeNanos), captured as
-                // close to recorder start as possible. Written to the IMU sidecar so the consumer can
-                // align frames (relative MP4 PTS) to IMU samples and subtract the fixed startup offset.
-                long videoStartElapsedRealtimeNs = android.os.SystemClock.elapsedRealtimeNanos();
-                isRecording = true;
-                recordingStartTime = System.currentTimeMillis();
-
-                ImuRecorder imu = hooks.ensureImuRecorder();
-                if (imu != null) {
-                    imu.startRecording(currentVideoPath);
-                    imu.setVideoStartAnchor(videoStartElapsedRealtimeNs);
-                }
-
-                pendingSettings = null;
-                final String startedId = currentVideoId;
-                if (callback != null) {
-                    callbackExecutor.execute(() -> {
-                        if (callback != null) callback.onRecordingStarted(startedId);
-                    });
-                }
-                if (callback != null) {
-                    recordingTimer = new Timer();
-                    recordingTimer.schedule(new TimerTask() {
-                        @Override
-                        public void run() {
-                            if (!isRecording || callback == null) return;
-                            long duration = System.currentTimeMillis() - recordingStartTime;
-                            final String tickId = currentVideoId;
-                            callbackExecutor.execute(() -> {
-                                if (callback != null) callback.onRecordingProgress(tickId, duration);
-                            });
-                        }
-                    }, 1000, 1000);
-                }
-                Log.d(TAG, "Video recording started for: " + currentVideoId);
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to start recording after delay", e);
-                notifyError(currentVideoId, "Failed to start recording: " + e.getMessage());
-                isRecording = false;
-                // IMU may already be recording (started above); stop it so the sensor listener and
-                // partial stream don't keep running after a failed start.
-                ImuRecorder imu = hooks.currentImuRecorder();
-                if (imu != null) {
-                    imu.cancel();
+        CameraCaptureSession.CaptureCallback aeGate = new CameraCaptureSession.CaptureCallback() {
+            @Override
+            public void onCaptureCompleted(CameraCaptureSession s, CaptureRequest request,
+                                           TotalCaptureResult result) {
+                if (recorderStarted) return;
+                long elapsed = SystemClock.elapsedRealtime() - previewStartElapsedMs;
+                if (elapsed < VideoRecorderPolicy.RECORDER_SURFACE_WARMUP_MS) return;
+                if (VideoRecorderPolicy.isAeReadyForRecording(result.get(CaptureResult.CONTROL_AE_STATE))) {
+                    beginRecorderStart("ae_converged");
                 }
             }
-        }, VideoRecorderPolicy.RECORDER_SURFACE_WARMUP_MS);
+        };
+        session.setRepeatingRequest(previewBuilder.build(), aeGate, backgroundHandler);
+
+        // Fallback: AE may never report a ready state (or the device may not report AE at all).
+        backgroundHandler.postDelayed(() -> beginRecorderStart("timeout"),
+                VideoRecorderPolicy.AE_CONVERGE_TIMEOUT_MS);
+    }
+
+    /**
+     * Starts the encoder + IMU + progress timer exactly once — invoked by the AE gate (sensor
+     * exposed) or the timeout fallback, whichever fires first. Guarded by {@link #recorderStarted}.
+     */
+    private void beginRecorderStart(String reason) {
+        if (recorderStarted) return;
+        // Mark done up front so neither the per-frame AE gate nor the timeout can re-enter (both
+        // run on backgroundHandler, so this is race-free), even on the surface-invalid error path.
+        recorderStarted = true;
+        try {
+            if (recorderSurface == null || !recorderSurface.isValid()) {
+                Log.e(TAG, "Camera not ready for recording - surface invalid");
+                notifyError(currentVideoId, "Camera not ready for recording");
+                return;
+            }
+
+            mediaRecorder.start();
+            // Anchor for the video timeline on the IMU clock (elapsedRealtimeNanos), captured as
+            // close to recorder start as possible. Written to the IMU sidecar so the consumer can
+            // align frames (relative MP4 PTS) to IMU samples and subtract the fixed startup offset.
+            long videoStartElapsedRealtimeNs = SystemClock.elapsedRealtimeNanos();
+            isRecording = true;
+            recordingStartTime = System.currentTimeMillis();
+
+            ImuRecorder imu = hooks.ensureImuRecorder();
+            if (imu != null) {
+                imu.startRecording(currentVideoPath);
+                imu.setVideoStartAnchor(videoStartElapsedRealtimeNs);
+            }
+
+            pendingSettings = null;
+            final String startedId = currentVideoId;
+            if (callback != null) {
+                callbackExecutor.execute(() -> {
+                    if (callback != null) callback.onRecordingStarted(startedId);
+                });
+            }
+            if (callback != null) {
+                recordingTimer = new Timer();
+                recordingTimer.schedule(new TimerTask() {
+                    @Override
+                    public void run() {
+                        if (!isRecording || callback == null) return;
+                        long duration = System.currentTimeMillis() - recordingStartTime;
+                        final String tickId = currentVideoId;
+                        callbackExecutor.execute(() -> {
+                            if (callback != null) callback.onRecordingProgress(tickId, duration);
+                        });
+                    }
+                }, 1000, 1000);
+            }
+            Log.d(TAG, "Video recording started for: " + currentVideoId + " (start reason=" + reason + ")");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start recording", e);
+            notifyError(currentVideoId, "Failed to start recording: " + e.getMessage());
+            isRecording = false;
+            // IMU may already be recording (started above); stop it so the sensor listener and
+            // partial stream don't keep running after a failed start.
+            ImuRecorder imu = hooks.currentImuRecorder();
+            if (imu != null) {
+                imu.cancel();
+            }
+        }
     }
 
     /**
