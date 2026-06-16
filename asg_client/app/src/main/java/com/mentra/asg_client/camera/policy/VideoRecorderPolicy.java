@@ -1,5 +1,6 @@
 package com.mentra.asg_client.camera.policy;
 
+import android.hardware.camera2.CaptureResult;
 import android.media.MediaRecorder;
 
 import com.mentra.asg_client.settings.VideoSettings;
@@ -17,13 +18,36 @@ public final class VideoRecorderPolicy {
     public static final long MIN_RECORDING_DURATION_WARN_MS = 500;
 
     /**
-     * Delay between starting the repeating preview and calling {@link MediaRecorder#start()}.
+     * Minimum delay between starting the repeating preview and calling {@link MediaRecorder#start()}.
      * Ensures the recorder surface has received the first frames so the resulting MP4 has both
-     * video and audio (prevents audio-only recordings). Phase 3.4 named this constant.
+     * video and audio (prevents audio-only recordings). Now used as a FLOOR by the auto-exposure
+     * gate (see {@link #isAeReadyForRecording(Integer)}): the recorder also waits for AE to settle
+     * so the first (cold-camera) recording isn't black. Phase 3.4 named this constant.
      */
     public static final long RECORDER_SURFACE_WARMUP_MS = 900;
 
+    /**
+     * Hard cap for the auto-exposure gate: if AE never reports a ready state (or the device doesn't
+     * report AE state at all), start the recorder anyway after this long so capture never hangs.
+     */
+    public static final long AE_CONVERGE_TIMEOUT_MS = 3000;
+
     private VideoRecorderPolicy() {}
+
+    /**
+     * Whether auto-exposure has settled enough to start recording (sensor is exposing real frames,
+     * not the black / under-exposed frames seen right after a cold camera open). Mirrors the AE
+     * states the photo pipeline treats as "ready". A {@code null} state (device not reporting AE)
+     * is treated as not-ready, so the gate falls back to {@link #AE_CONVERGE_TIMEOUT_MS}.
+     */
+    public static boolean isAeReadyForRecording(Integer aeState) {
+        if (aeState == null) {
+            return false;
+        }
+        return aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED
+                || aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED
+                || aeState == CaptureResult.CONTROL_AE_STATE_LOCKED;
+    }
 
     /**
      * H.264 video bitrate: higher for 1080p-class width, lower for 720p and below.
