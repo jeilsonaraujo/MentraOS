@@ -308,6 +308,19 @@ data class VideoRecordingStatusEvent(
     val data: Map<String, Any>? get() = stringMapValue(values["data"])
 }
 
+/**
+ * Immediate acceptance ACK for a stop_video_recording command (wire type
+ * "stop_video_recording_ack"). Confirms the glasses received and accepted the stop request; it does
+ * not imply the recording has finished stopping or that the upload completed.
+ */
+data class StopRecordingAckEvent(
+    val values: Map<String, Any>,
+) {
+    val requestId: String get() = stringValue(values, "requestId").orEmpty()
+    val status: String get() = stringValue(values, "status").orEmpty()
+    val timestamp: Long get() = longValue(values, "timestamp") ?: System.currentTimeMillis()
+}
+
 data class MediaUploadEvent(
     val values: Map<String, Any>,
 ) {

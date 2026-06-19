@@ -203,6 +203,30 @@ public class MediaManager implements IMediaManager {
     }
 
     @Override
+    public void sendStopRecordingAck(String requestId) {
+        if (requestId == null || requestId.isEmpty()) {
+            Log.w(TAG, "Cannot send stop recording ACK - missing requestId");
+            return;
+        }
+        if (!isBleConnected()) {
+            Log.w(TAG, "Cannot send stop recording ACK - not connected to BLE device");
+            return;
+        }
+        try {
+            JSONObject response = new JSONObject();
+            response.put("type", "stop_video_recording_ack");
+            response.put("requestId", requestId);
+            response.put("status", "accepted");
+            response.put("timestamp", System.currentTimeMillis());
+            String jsonString = response.toString();
+            Log.d(TAG, "📤 Sending stop recording ACK: " + jsonString);
+            serviceManager.getBluetoothManager().sendMessage(jsonString.getBytes());
+        } catch (JSONException e) {
+            Log.e(TAG, "Error creating stop recording ACK", e);
+        }
+    }
+
+    @Override
     public StreamingStatusCallback getStreamingStatusCallback() {
         return streamingStatusCallback;
     }
