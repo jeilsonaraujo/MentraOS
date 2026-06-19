@@ -5324,12 +5324,17 @@ extension MentraLive {
     }
 
     func stopVideoRecording(requestId: String) {
-        stopVideoRecording(requestId: requestId, webhookUrl: nil, authToken: nil)
+        stopVideoRecording(
+            requestId: requestId, webhookUrl: nil, authToken: nil, upload: nil, onComplete: nil
+        )
     }
 
-    func stopVideoRecording(requestId: String, webhookUrl: String?, authToken: String?) {
+    func stopVideoRecording(
+        requestId: String, webhookUrl: String?, authToken: String?,
+        upload: [String: Any]?, onComplete: [String: Any]?
+    ) {
         Bridge.log(
-            "Stopping video recording on glasses: requestId=\(requestId), webhook=\((webhookUrl?.isEmpty ?? true) ? "none" : "set")"
+            "Stopping video recording on glasses: requestId=\(requestId), upload=\(upload == nil ? "none" : "set"), webhook=\((webhookUrl?.isEmpty ?? true) ? "none" : "set")"
         )
 
         guard connectionState == ConnTypes.CONNECTED else {
@@ -5341,13 +5346,44 @@ extension MentraLive {
             "type": "stop_video_recording",
             "requestId": requestId,
         ]
-        // Webhook upload target, supplied at stop so the token is fresh.
-        // Only sent when present; empty webhook = keep video on device.
+        // Generic app-described upload (method/url/headers/body) the glasses execute
+        // verbatim, plus an optional completion callback. Opaque to the SDK; takes
+        // precedence over the legacy webhook on the glasses side. Supplied at stop
+        // so any signed URL / token is fresh.
+        if let upload {
+            json["upload"] = upload
+        }
+        if let onComplete {
+            json["onComplete"] = onComplete
+        }
+        // Legacy multipart webhook target (fallback). Only sent when present;
+        // empty webhook = keep video on device.
         if let webhookUrl, !webhookUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             json["webhookUrl"] = webhookUrl
         }
         if let authToken, !authToken.isEmpty {
             json["authToken"] = authToken
+        }
+        sendJson(json)
+    }
+
+    func uploadVideo(requestId: String, upload: [String: Any]?, onComplete: [String: Any]?) {
+        Bridge.log("Re-uploading existing video on glasses: requestId=\(requestId)")
+        guard connectionState == ConnTypes.CONNECTED else {
+            Bridge.log("Cannot upload video - not connected")
+            return
+        }
+        var json: [String: Any] = [
+            "type": "upload_video",
+            "requestId": requestId,
+        ]
+        // Generic app-described upload (method/url/headers/body) the glasses execute
+        // verbatim, plus an optional completion callback. Opaque to the SDK.
+        if let upload {
+            json["upload"] = upload
+        }
+        if let onComplete {
+            json["onComplete"] = onComplete
         }
         sendJson(json)
     }

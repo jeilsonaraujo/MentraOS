@@ -1249,11 +1249,26 @@ struct ViewState {
         )
     }
 
-    func stopVideoRecording(_ requestId: String, _ webhookUrl: String?, _ authToken: String?) {
+    func stopVideoRecording(
+        _ requestId: String, _ webhookUrl: String?, _ authToken: String?,
+        _ upload: [String: Any]? = nil, _ onComplete: [String: Any]? = nil
+    ) {
         Bridge.log(
-            "MAN: onStopVideoRecording: requestId=\(requestId), webhook=\((webhookUrl?.isEmpty ?? true) ? "none" : "set")"
+            "MAN: onStopVideoRecording: requestId=\(requestId), upload=\(upload == nil ? "none" : "set"), webhook=\((webhookUrl?.isEmpty ?? true) ? "none" : "set")"
         )
-        sgc?.stopVideoRecording(requestId: requestId, webhookUrl: webhookUrl, authToken: authToken)
+        sgc?.stopVideoRecording(
+            requestId: requestId, webhookUrl: webhookUrl, authToken: authToken,
+            upload: upload, onComplete: onComplete
+        )
+    }
+
+    func uploadVideo(
+        _ requestId: String, _ upload: [String: Any]?, _ onComplete: [String: Any]? = nil
+    ) {
+        Bridge.log(
+            "MAN: onUploadVideo: requestId=\(requestId), upload=\(upload == nil ? "none" : "set")"
+        )
+        sgc?.uploadVideo(requestId: requestId, upload: upload, onComplete: onComplete)
     }
 
     func setMicState() {

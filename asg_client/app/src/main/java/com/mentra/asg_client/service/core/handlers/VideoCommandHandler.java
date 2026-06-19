@@ -4,11 +4,15 @@ import android.content.Context;
 import android.util.Log;
 import com.mentra.asg_client.io.file.core.FileManager;
 import com.mentra.asg_client.io.media.core.MediaCaptureService;
+import com.mentra.asg_client.io.media.core.UploadSpec;
 import com.mentra.asg_client.service.core.constants.BatteryConstants;
 import com.mentra.asg_client.service.legacy.managers.AsgClientServiceManager;
 import com.mentra.asg_client.service.media.interfaces.IMediaManager;
 import com.mentra.asg_client.service.system.interfaces.IStateManager;
 import com.mentra.asg_client.settings.VideoSettings;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Set;
 import org.json.JSONException;
@@ -26,6 +30,16 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
     // `minutes * 60 * 1000L` timer math (which multiplies as int before promotion to long) so a
     // garbage/overflowing value can't wrap to a negative duration and trigger an immediate stop.
     private static final int MAX_RECORDING_TIME_MINUTES = 24 * 60;
+
+    // Stop commands are delivered reliably by the phone: it keeps retrying the same
+    // stop_video_recording (same requestId) until it sees our ACK, because either the command or the
+    // ACK can be dropped on BLE. We remember the requestIds we've already accepted so a retry just
+    // re-ACKs without stopping/uploading twice. Bounded (insertion-ordered, oldest evicted) so a
+    // long session can't grow it without limit.
+    private static final int MAX_TRACKED_STOP_REQUEST_IDS = 64;
+
+    private final Set<String> acceptedStopRequestIds =
+            Collections.synchronizedSet(new LinkedHashSet<>());
 
     private final AsgClientServiceManager serviceManager;
     private final IMediaManager streamingManager;
@@ -46,7 +60,10 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
     @Override
     public Set<String> getSupportedCommandTypes() {
         return Set.of(
-                "start_video_recording", "stop_video_recording", "get_video_recording_status");
+                "start_video_recording",
+                "stop_video_recording",
+                "get_video_recording_status",
+                "upload_video");
     }
 
     @Override
@@ -57,6 +74,8 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
                     return handleStartVideoRecording(data);
                 case "stop_video_recording":
                     return handleStopCommand(data);
+                case "upload_video":
+                    return handleUploadCommand(data);
                 case "get_video_recording_status":
                     return handleStatusCommand(data);
                 default:
@@ -233,14 +252,21 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
 
     /** Handle stop video recording command */
     public boolean handleStopCommand(JSONObject data) {
+        String requestId = data != null ? data.optString("requestId", "") : "";
         // Do not log the full payload: a stop command may carry an upload `authToken`.
-        Log.d(
-                TAG,
-                "handleStopCommand called with requestId: "
-                        + (data != null ? data.optString("requestId", "") : ""));
+        Log.d(TAG, "handleStopCommand called with requestId: " + requestId);
 
         try {
-            String requestId = data != null ? data.optString("requestId", "") : "";
+            // Idempotency: the phone retries stop until it sees our ACK, so the same requestId can
+            // arrive multiple times — including after the recording already stopped (first ACK was
+            // lost) or while the stop is still in flight. If we've already accepted this requestId,
+            // just re-send the ACK and return; never restart the stop or kick off a second upload.
+            if (!requestId.isEmpty() && acceptedStopRequestIds.contains(requestId)) {
+                Log.d(TAG, "Duplicate stop_video_recording for " + requestId + " - re-ACK only");
+                streamingManager.sendStopRecordingAck(requestId);
+                return true;
+            }
+
             MediaCaptureService captureService = serviceManager.getMediaCaptureService();
             if (captureService == null) {
                 Log.e(TAG, "Media capture service is not initialized");
@@ -256,17 +282,37 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
                 return false;
             }
 
-            // Optional upload target supplied at STOP (not start) so the auth token is still
-            // fresh when the upload actually runs — a recording can last arbitrarily long.
-            // Empty webhook = no upload (video stays on device).
+            // Command is valid and actionable → acknowledge acceptance immediately (before the
+            // upload even starts) and remember the requestId so subsequent retries are idempotent.
+            // Recording is about to stop; recording the id now also covers the in-flight window
+            // where a retry arrives before isRecordingVideo() flips to false.
+            if (!requestId.isEmpty()) {
+                rememberStopAccepted(requestId);
+                streamingManager.sendStopRecordingAck(requestId);
+            }
+
+            // Optional upload target supplied at STOP (not start) so any signed URL / auth token is
+            // still fresh when the upload actually runs — a recording can last arbitrarily long.
+            // Prefer a generic `upload` descriptor (method/url/headers/body) when present, so the
+            // glasses can PUT straight to S3 (or anywhere) without firmware changes; otherwise fall
+            // back to the legacy multipart webhook (webhookUrl + authToken). Empty/none = no upload.
+            UploadSpec uploadSpec = UploadSpec.fromJson(data);
             String webhookUrl = data != null ? data.optString("webhookUrl", "") : "";
             String authToken = data != null ? data.optString("authToken", "") : "";
 
             // If requestId provided, use handleStopVideoCommand for validation
             // Otherwise use direct stopVideoRecording for backward compatibility
             if (requestId != null && !requestId.isEmpty()) {
-                Log.d(TAG, "Stopping video with requestId validation: " + requestId);
-                captureService.handleStopVideoCommand(requestId, webhookUrl, authToken);
+                if (uploadSpec != null) {
+                    Log.d(TAG, "Stopping video with described upload, requestId: " + requestId);
+                    captureService.handleStopVideoCommand(requestId, uploadSpec);
+                } else {
+                    Log.d(TAG, "Stopping video with requestId validation: " + requestId);
+                    captureService.handleStopVideoCommand(requestId, webhookUrl, authToken);
+                }
+            } else if (uploadSpec != null) {
+                Log.d(TAG, "Stopping video with described upload (no requestId)");
+                captureService.stopVideoRecording(uploadSpec);
             } else {
                 Log.d(TAG, "Stopping video without requestId (backward compatibility mode)");
                 captureService.stopVideoRecording(webhookUrl, authToken);
@@ -275,7 +321,57 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
             return true;
         } catch (Exception e) {
             Log.e(TAG, "Error handling stop video command", e);
-            String requestId = data != null ? data.optString("requestId", "") : "";
+            streamingManager.sendVideoRecordingStatusResponse(
+                    requestId, false, "error", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Remember that we've accepted a stop command for {@code requestId} so duplicate retries are
+     * idempotent. Insertion-ordered with oldest-first eviction past {@link
+     * #MAX_TRACKED_STOP_REQUEST_IDS}.
+     */
+    private void rememberStopAccepted(String requestId) {
+        synchronized (acceptedStopRequestIds) {
+            acceptedStopRequestIds.add(requestId);
+            while (acceptedStopRequestIds.size() > MAX_TRACKED_STOP_REQUEST_IDS) {
+                Iterator<String> it = acceptedStopRequestIds.iterator();
+                it.next();
+                it.remove();
+            }
+        }
+    }
+
+    /**
+     * Handle a re-upload command: upload an already-recorded clip (identified by requestId) using
+     * the supplied generic upload descriptor. Used by the phone to retry an upload that failed
+     * earlier — the clip is still on the glasses; we just run the described upload again.
+     */
+    public boolean handleUploadCommand(JSONObject data) {
+        String requestId = data != null ? data.optString("requestId", "") : "";
+        try {
+            MediaCaptureService captureService = serviceManager.getMediaCaptureService();
+            if (captureService == null) {
+                Log.e(TAG, "Media capture service is not initialized");
+                streamingManager.sendVideoRecordingStatusResponse(
+                        requestId, false, "service_unavailable", null);
+                return false;
+            }
+
+            UploadSpec uploadSpec = UploadSpec.fromJson(data);
+            if (requestId.isEmpty() || uploadSpec == null) {
+                Log.w(TAG, "upload_video missing requestId or upload descriptor");
+                streamingManager.sendVideoRecordingStatusResponse(
+                        requestId, false, "invalid_upload_request", null);
+                return false;
+            }
+
+            Log.d(TAG, "Re-uploading existing video, requestId: " + requestId);
+            captureService.uploadExistingVideo(requestId, uploadSpec);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Error handling upload_video command", e);
             streamingManager.sendVideoRecordingStatusResponse(
                     requestId, false, "error", e.getMessage());
             return false;

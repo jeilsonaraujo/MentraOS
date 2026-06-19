@@ -1247,11 +1247,37 @@ public class AsgClientService extends Service implements NetworkStateListener, T
             @Override
             public void onVideoUploading(String requestId) {
                 Log.i(TAG, "📤 Video uploading started - ID: " + requestId);
+                if (streamingManager != null) {
+                    streamingManager.sendVideoRecordingStatusResponse(
+                            requestId, true, "upload_started", null);
+                }
             }
 
             @Override
             public void onVideoUploaded(String requestId, String url) {
                 Log.i(TAG, "✅ Video uploaded successfully - ID: " + requestId + ", URL: " + url);
+                if (streamingManager != null) {
+                    streamingManager.sendVideoRecordingStatusResponse(
+                            requestId, true, "upload_completed", null);
+                }
+            }
+
+            @Override
+            public void onVideoUploadProgress(String requestId, long bytesSent, long bytesTotal) {
+                if (streamingManager == null || bytesTotal <= 0) {
+                    return;
+                }
+                int percent = (int) Math.min(100L, (bytesSent * 100L) / bytesTotal);
+                try {
+                    org.json.JSONObject statusObject = new org.json.JSONObject();
+                    statusObject.put("status", "uploading");
+                    statusObject.put("progress", percent);
+                    statusObject.put("bytesSent", bytesSent);
+                    statusObject.put("bytesTotal", bytesTotal);
+                    streamingManager.sendVideoRecordingStatusResponse(requestId, true, statusObject);
+                } catch (org.json.JSONException e) {
+                    Log.w(TAG, "Failed to build upload progress status for " + requestId, e);
+                }
             }
 
             @Override

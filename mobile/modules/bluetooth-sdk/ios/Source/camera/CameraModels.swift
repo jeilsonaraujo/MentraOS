@@ -284,6 +284,35 @@ public struct VideoRecordingStatusEvent: CustomStringConvertible {
     }
 }
 
+/// Immediate acceptance ACK for a stop_video_recording command (wire type
+/// "stop_video_recording_ack"). Confirms the glasses received and accepted the stop request; it
+/// does not imply the recording has finished stopping or that the upload completed.
+public struct StopRecordingAckEvent: CustomStringConvertible {
+    public let values: [String: Any]
+
+    public init(values: [String: Any]) {
+        var values = values
+        values["type"] = "stop_video_recording_ack"
+        self.values = values
+    }
+
+    public var requestId: String {
+        stringValue(values, "requestId") ?? ""
+    }
+
+    public var status: String {
+        stringValue(values, "status") ?? ""
+    }
+
+    public var timestamp: Int {
+        intValue(values["timestamp"]) ?? Int(Date().timeIntervalSince1970 * 1000)
+    }
+
+    public var description: String {
+        "StopRecordingAckEvent(requestId: \(requestId), status: \(status))"
+    }
+}
+
 public struct MediaUploadEvent: CustomStringConvertible {
     public let values: [String: Any]
 

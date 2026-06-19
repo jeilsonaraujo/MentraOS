@@ -126,10 +126,15 @@ public class MediaCaptureService {
     private static final class UploadTarget {
         final String webhookUrl;
         final String authToken;
+        // Generic app-described upload (method/url/headers/body). When non-null it takes
+        // precedence over webhookUrl/authToken, letting the glasses PUT straight to S3 (or
+        // anywhere) without firmware changes. Null = use the legacy multipart-webhook path.
+        final UploadSpec spec;
 
-        UploadTarget(String webhookUrl, String authToken) {
+        UploadTarget(String webhookUrl, String authToken, UploadSpec spec) {
             this.webhookUrl = webhookUrl;
             this.authToken = authToken;
+            this.spec = spec;
         }
     }
 
@@ -247,6 +252,13 @@ public class MediaCaptureService {
         void onVideoUploading(String requestId);
 
         void onVideoUploaded(String requestId, String url);
+
+        /**
+         * Periodic upload progress for a video ({@code bytesSent} of {@code bytesTotal}).
+         * Default no-op so existing listeners need not implement it. Generic — it carries
+         * only byte counts, with no knowledge of the upload destination.
+         */
+        default void onVideoUploadProgress(String requestId, long bytesSent, long bytesTotal) {}
 
         // Common events
         void onMediaError(String requestId, String error, int mediaType);
@@ -646,6 +658,27 @@ public class MediaCaptureService {
      * @param requestId Request ID of the video to stop (must match current recording)
      */
     public void handleStopVideoCommand(String requestId, String webhookUrl, String authToken) {
+        if (validateStopRequest(requestId)) {
+            stopVideoRecording(webhookUrl, authToken);
+        }
+    }
+
+    /**
+     * Generic-descriptor variant of {@link #handleStopVideoCommand(String, String, String)}:
+     * validates the stop, then uploads the clip via the app-described request(s) in {@code spec}
+     * (e.g. a raw PUT straight to S3) instead of the legacy multipart webhook.
+     */
+    public void handleStopVideoCommand(String requestId, UploadSpec spec) {
+        if (validateStopRequest(requestId)) {
+            stopVideoRecording(spec);
+        }
+    }
+
+    /**
+     * Shared guard for a requestId-scoped stop: must be recording, and the requestId must match
+     * the active recording. Reports the matching media error and returns false on failure.
+     */
+    private boolean validateStopRequest(String requestId) {
         Log.d(TAG, "handleStopVideoCommand called with requestId: " + requestId);
 
         if (!isRecordingVideo) {
@@ -654,7 +687,7 @@ public class MediaCaptureService {
                 mMediaCaptureListener.onMediaError(
                         requestId, "Not recording", MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
             }
-            return;
+            return false;
         }
 
         // Verify the requestId matches current recording
@@ -664,10 +697,10 @@ public class MediaCaptureService {
                 mMediaCaptureListener.onMediaError(
                         requestId, "Request ID mismatch", MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
             }
-            return;
+            return false;
         }
 
-        stopVideoRecording(webhookUrl, authToken);
+        return true;
     }
 
     /** Start video recording locally with auto-generated IDs */
@@ -958,6 +991,13 @@ public class MediaCaptureService {
                                                                     uploadTarget != null
                                                                             ? uploadTarget.authToken
                                                                             : null;
+                                                            // Generic app-described upload (e.g.
+                                                            // raw PUT to S3) when present; else the
+                                                            // legacy multipart-webhook path.
+                                                            final UploadSpec uploadSpec =
+                                                                    uploadTarget != null
+                                                                            ? uploadTarget.spec
+                                                                            : null;
                                                             if (ok) {
                                                                 if (mMediaCaptureListener != null) {
                                                                     mMediaCaptureListener
@@ -966,12 +1006,20 @@ public class MediaCaptureService {
                                                                                     filePath);
                                                                 }
                                                                 sendGalleryStatusUpdate();
-                                                                uploadVideo(
-                                                                        filePath,
-                                                                        pendingRequestId,
-                                                                        uploadWebhookUrl,
-                                                                        uploadAuthToken,
-                                                                        save);
+                                                                if (uploadSpec != null) {
+                                                                    performDescribedUpload(
+                                                                            filePath,
+                                                                            pendingRequestId,
+                                                                            uploadSpec,
+                                                                            save);
+                                                                } else {
+                                                                    uploadVideo(
+                                                                            filePath,
+                                                                            pendingRequestId,
+                                                                            uploadWebhookUrl,
+                                                                            uploadAuthToken,
+                                                                            save);
+                                                                }
                                                             } else {
                                                                 final boolean cleaningUp =
                                                                         isCleaningUp.get();
@@ -1138,7 +1186,7 @@ public class MediaCaptureService {
      * @param reason Why recording is stopping
      */
     private void stopVideoRecording(StopReason reason) {
-        stopVideoRecording(reason, null, null);
+        stopVideoRecording(reason, null, null, null);
     }
 
     /**
@@ -1156,7 +1204,8 @@ public class MediaCaptureService {
      * @param webhookUrl Upload target (USER_REQUESTED only); null/empty keeps the video on device
      * @param authToken Bearer token for the webhook upload
      */
-    private void stopVideoRecording(StopReason reason, String webhookUrl, String authToken) {
+    private void stopVideoRecording(
+            StopReason reason, String webhookUrl, String authToken, UploadSpec spec) {
         synchronized (mStopLock) {
             // Prevent recursive/concurrent stops
             if (mCurrentStopReason != null) {
@@ -1230,8 +1279,8 @@ public class MediaCaptureService {
             if (captureId != null) {
                 UploadTarget target =
                         reason == StopReason.USER_REQUESTED
-                                ? new UploadTarget(webhookUrl, authToken)
-                                : new UploadTarget(null, null);
+                                ? new UploadTarget(webhookUrl, authToken, spec)
+                                : new UploadTarget(null, null, null);
                 uploadTargetsByCaptureId.putIfAbsent(captureId, target);
             }
 
@@ -1275,7 +1324,7 @@ public class MediaCaptureService {
      */
     public void stopVideoRecording() {
         // No-webhook variant (button / power / toggle): no upload target.
-        stopVideoRecording(StopReason.USER_REQUESTED, null, null);
+        stopVideoRecording(StopReason.USER_REQUESTED, null, null, null);
     }
 
     /**
@@ -1284,7 +1333,16 @@ public class MediaCaptureService {
      * is fresh when the upload runs. An empty/null webhook keeps the video on device (no upload).
      */
     public void stopVideoRecording(String webhookUrl, String authToken) {
-        stopVideoRecording(StopReason.USER_REQUESTED, webhookUrl, authToken);
+        stopVideoRecording(StopReason.USER_REQUESTED, webhookUrl, authToken, null);
+    }
+
+    /**
+     * Stop the active recording and upload the result via an app-described request (e.g. a raw PUT
+     * straight to S3), with an optional completion callback. Supplied at STOP time so any signed
+     * URL / token is fresh. See {@link UploadSpec}.
+     */
+    public void stopVideoRecording(UploadSpec spec) {
+        stopVideoRecording(StopReason.USER_REQUESTED, null, null, spec);
     }
 
     /** Check if currently recording video */
@@ -2867,6 +2925,62 @@ public class MediaCaptureService {
                 .start();
     }
 
+    /**
+     * Re-upload an already-recorded clip identified by {@code requestId} (a retry triggered by the
+     * phone after a failed upload). The clip is still on the glasses; we locate it by its requestId
+     * and run the described upload again. Generic — the app supplies the upload descriptor.
+     */
+    public void uploadExistingVideo(String requestId, UploadSpec spec) {
+        if (spec == null) {
+            Log.w(TAG, "uploadExistingVideo: no upload descriptor for " + requestId);
+            return;
+        }
+        File clip = findRecordedClip(requestId);
+        if (clip == null) {
+            Log.e(TAG, "❌ uploadExistingVideo: no clip found on device for requestId " + requestId);
+            sendMediaErrorResponse(
+                    requestId,
+                    "Clip not found for re-upload",
+                    MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
+            if (mMediaCaptureListener != null) {
+                mMediaCaptureListener.onMediaError(
+                        requestId,
+                        "Clip not found for re-upload",
+                        MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
+            }
+            return;
+        }
+        Log.d(TAG, "🔁 Re-uploading clip for " + requestId + ": " + clip.getAbsolutePath());
+        performDescribedUpload(clip.getAbsolutePath(), requestId, spec, /* save= */ true);
+    }
+
+    /**
+     * Locate a recorded clip's {@code base.mp4} by its requestId. Recordings live in
+     * {@code <mediaDir>/VID_<timestamp>_<rand>_<requestId>/base.mp4}, so the capture dir's name
+     * ends with the requestId.
+     */
+    private File findRecordedClip(String requestId) {
+        if (requestId == null || requestId.isEmpty()) {
+            return null;
+        }
+        File mediaDir = fileManager.getDefaultMediaDirectory();
+        File[] dirs = (mediaDir != null) ? mediaDir.listFiles() : null;
+        if (dirs == null) {
+            return null;
+        }
+        for (File dir : dirs) {
+            if (dir.isDirectory()
+                    && dir.getName().startsWith("VID_")
+                    && dir.getName().endsWith(requestId)) {
+                File base = new File(dir, "base.mp4");
+                if (base.exists()) {
+                    return base;
+                }
+            }
+        }
+        return null;
+    }
+
     /** Upload a video file to AugmentOS Cloud Currently a stub - videos are kept on device */
     public void uploadVideo(
             String videoFilePath,
@@ -3068,6 +3182,315 @@ public class MediaCaptureService {
                         },
                         "VideoWebhookUpload-" + requestId)
                 .start();
+    }
+
+    /** Number of attempts for each described request (the upload and the optional callback). */
+    private static final int UPLOAD_MAX_ATTEMPTS = 3;
+
+    /**
+     * Upload a recorded video using a generic, app-described request (see {@link UploadSpec}) on a
+     * background thread. Unlike {@link #performDirectVideoUpload}, the firmware knows nothing about
+     * the destination: the phone/backend supplies method, URL, headers and body shape — typically a
+     * raw {@code PUT} straight to S3, which sidesteps the app server entirely (no body-size cap, no
+     * server-side buffering). An optional {@code onComplete} request fires only after the upload
+     * returns 2xx (e.g. to register the segment on the backend).
+     *
+     * <p>On any failure the file is kept on device so the rescan/queue can retry; there is no BLE
+     * fallback (video files are far too large).
+     */
+    private void performDescribedUpload(
+            String videoFilePath, String requestId, UploadSpec spec, boolean save) {
+        Log.d(TAG, "📤 Starting described (generic) video upload for: " + requestId);
+        Log.d(TAG, "🎥 Upload file: " + videoFilePath);
+
+        if (mMediaCaptureListener != null) {
+            mMediaCaptureListener.onVideoUploading(requestId);
+        }
+
+        new Thread(
+                        () -> {
+                            File videoFile = new File(videoFilePath);
+                            try {
+                                if (!videoFile.exists()) {
+                                    failDescribedUpload(
+                                            requestId, "Video file not found: " + videoFilePath);
+                                    return;
+                                }
+                                Log.d(TAG, "📊 Video file size: " + videoFile.length() + " bytes");
+
+                                // 1) Main upload (the bytes) — e.g. raw PUT to S3.
+                                int uploadCode =
+                                        executeDescribedRequest(spec.upload, videoFile, requestId);
+                                if (uploadCode < 200 || uploadCode >= 300) {
+                                    failDescribedUpload(
+                                            requestId,
+                                            "Video upload failed with status: " + uploadCode);
+                                    return;
+                                }
+
+                                // 2) Optional completion callback (e.g. register the segment).
+                                if (spec.onComplete != null) {
+                                    int doneCode =
+                                            executeDescribedRequest(
+                                                    spec.onComplete, videoFile, null);
+                                    if (doneCode < 200 || doneCode >= 300) {
+                                        failDescribedUpload(
+                                                requestId,
+                                                "Upload completion callback failed with status: "
+                                                        + doneCode);
+                                        return;
+                                    }
+                                }
+
+                                Log.d(TAG, "✅ Video uploaded successfully (described upload)");
+                                sendMediaSuccessResponse(
+                                        requestId,
+                                        spec.upload.url,
+                                        MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
+
+                                if (!save) {
+                                    if (videoFile.delete()) {
+                                        Log.d(TAG, "🗑️ Deleted video file after successful upload");
+                                    } else {
+                                        Log.w(TAG, "⚠️ Failed to delete video file");
+                                    }
+                                } else {
+                                    Log.d(TAG, "💾 Keeping video file as requested");
+                                }
+
+                                if (mMediaCaptureListener != null) {
+                                    mMediaCaptureListener.onVideoUploaded(requestId, spec.upload.url);
+                                }
+                            } catch (Exception e) {
+                                Log.e(TAG, "❌ Error during described video upload", e);
+                                // Keep the file for a later retry.
+                                failDescribedUpload(
+                                        requestId, "Video upload error: " + e.getMessage());
+                            }
+                        },
+                        "VideoDescribedUpload-" + requestId)
+                .start();
+    }
+
+    /** Report a described-upload failure to both the BLE channel and the capture listener. */
+    private void failDescribedUpload(String requestId, String message) {
+        Log.e(TAG, "❌ " + message);
+        sendMediaErrorResponse(requestId, message, MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
+        if (mMediaCaptureListener != null) {
+            mMediaCaptureListener.onMediaError(
+                    requestId, message, MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
+        }
+    }
+
+    /**
+     * Execute one described HTTP request, streaming the video file from disk when the body
+     * references it. HTTP/1.1 is forced — it removes the HTTP/2 {@code "stream was reset:
+     * NO_ERROR"} class that bites large bodies, and a single big upload gains nothing from h2.
+     * Retries only on {@link java.io.IOException} (network/stall), never on a received HTTP status,
+     * so a deterministic 4xx isn't hammered and a non-idempotent callback isn't double-fired on a
+     * real response. Returns the HTTP status code; throws the last IOException if all attempts fail.
+     */
+    private int executeDescribedRequest(
+            UploadSpec.RequestSpec rs, File videoFile, String progressRequestId)
+            throws java.io.IOException {
+        RequestBody body = buildDescribedBody(rs, videoFile);
+        if (progressRequestId != null) {
+            // Report byte-level upload progress for this requestId. Generic: just counts
+            // bytes streamed to the socket, no knowledge of the upload destination.
+            body = new ProgressRequestBody(body, progressRequestId);
+        }
+        String method =
+                (rs.method != null && !rs.method.isEmpty())
+                        ? rs.method.toUpperCase(Locale.US)
+                        : "POST";
+        Request.Builder requestBuilder = new Request.Builder().url(rs.url).method(method, body);
+        if (rs.headers != null) {
+            for (Map.Entry<String, String> entry : rs.headers.entrySet()) {
+                // Content-Type is owned by the request body so the multipart boundary and the
+                // S3-signed type are always correct; never let a headers entry override it.
+                if ("Content-Type".equalsIgnoreCase(entry.getKey())) {
+                    continue;
+                }
+                requestBuilder.header(entry.getKey(), entry.getValue());
+            }
+        }
+        Request request = requestBuilder.build();
+
+        // Whole-call deadline scaled to file size against a conservative throughput floor (mirrors
+        // performDirectVideoUpload) so a slow-but-healthy link isn't aborted mid-transfer.
+        long minThroughputBytesPerSec = 64L * 1024L; // ~0.5 Mbps floor
+        long callTimeoutSeconds = 60L + (videoFile.length() / minThroughputBytesPerSec);
+
+        java.io.IOException last = null;
+        for (int attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
+            OkHttpClient client =
+                    new OkHttpClient.Builder()
+                            .protocols(Collections.singletonList(okhttp3.Protocol.HTTP_1_1))
+                            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                            .writeTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
+                            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                            .callTimeout(callTimeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+                            .build();
+            try (Response response = client.newCall(request).execute()) {
+                int code = response.code();
+                Log.d(
+                        TAG,
+                        "📈 [described] "
+                                + method
+                                + " -> "
+                                + code
+                                + " (attempt "
+                                + attempt
+                                + "/"
+                                + UPLOAD_MAX_ATTEMPTS
+                                + ")");
+                return code;
+            } catch (java.io.IOException e) {
+                last = e;
+                Log.w(
+                        TAG,
+                        "⚠️ [described] "
+                                + method
+                                + " attempt "
+                                + attempt
+                                + "/"
+                                + UPLOAD_MAX_ATTEMPTS
+                                + " failed: "
+                                + e.getMessage());
+                if (attempt < UPLOAD_MAX_ATTEMPTS) {
+                    try {
+                        Thread.sleep(attempt * 1000L); // simple linear backoff
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new java.io.IOException("Upload interrupted", ie);
+                    }
+                }
+            }
+        }
+        throw last != null ? last : new java.io.IOException("Upload failed");
+    }
+
+    /**
+     * Wraps a {@link RequestBody} to report upload progress (bytes streamed to the socket) for
+     * {@code requestId} via {@link MediaCaptureListener#onVideoUploadProgress}. Fully generic —
+     * it knows nothing about the upload destination, only byte counts. Re-invoked on each OkHttp
+     * retry, so a retried attempt simply restarts the progress.
+     */
+    private final class ProgressRequestBody extends RequestBody {
+        private final RequestBody delegate;
+        private final String requestId;
+
+        ProgressRequestBody(RequestBody delegate, String requestId) {
+            this.delegate = delegate;
+            this.requestId = requestId;
+        }
+
+        @Override
+        public okhttp3.MediaType contentType() {
+            return delegate.contentType();
+        }
+
+        @Override
+        public long contentLength() throws java.io.IOException {
+            return delegate.contentLength();
+        }
+
+        @Override
+        public void writeTo(okio.BufferedSink sink) throws java.io.IOException {
+            okio.BufferedSink counting =
+                    okio.Okio.buffer(new CountingSink(sink, contentLength(), requestId));
+            delegate.writeTo(counting);
+            counting.flush();
+        }
+    }
+
+    /** Forwarding sink that emits throttled (every >=5%, plus the final 100%) progress callbacks. */
+    private final class CountingSink extends okio.ForwardingSink {
+        private final long total;
+        private final String requestId;
+        private long written = 0L;
+        private int lastPercent = -1;
+
+        CountingSink(okio.Sink delegate, long total, String requestId) {
+            super(delegate);
+            this.total = total;
+            this.requestId = requestId;
+        }
+
+        @Override
+        public void write(okio.Buffer source, long byteCount) throws java.io.IOException {
+            super.write(source, byteCount);
+            written += byteCount;
+            if (total <= 0 || mMediaCaptureListener == null) {
+                return;
+            }
+            int percent = (int) Math.min(100L, (written * 100L) / total);
+            boolean report = (percent >= 100) ? (lastPercent < 100) : (percent - lastPercent >= 5);
+            if (report) {
+                lastPercent = percent;
+                mMediaCaptureListener.onVideoUploadProgress(requestId, written, total);
+            }
+        }
+    }
+
+    /** Build the request body for a described request: raw file, multipart, or JSON. */
+    private RequestBody buildDescribedBody(UploadSpec.RequestSpec rs, File videoFile) {
+        String mode = (rs.bodyMode != null && !rs.bodyMode.isEmpty()) ? rs.bodyMode : "file";
+        switch (mode) {
+            case "json":
+                return RequestBody.create(
+                        okhttp3.MediaType.parse("application/json; charset=utf-8"),
+                        rs.jsonBody != null ? rs.jsonBody : "{}");
+            case "multipart":
+                {
+                    String fileField =
+                            (rs.fileField != null && !rs.fileField.isEmpty())
+                                    ? rs.fileField
+                                    : "video";
+                    MultipartBody.Builder builder =
+                            new MultipartBody.Builder().setType(MultipartBody.FORM);
+                    // Caller-provided form fields go first; the file part is appended LAST.
+                    // Generic multipart ordering (no endpoint specifics): order-sensitive
+                    // servers require the file to be the final part of the form.
+                    if (rs.fields != null) {
+                        for (Map.Entry<String, String> entry : rs.fields.entrySet()) {
+                            builder.addFormDataPart(entry.getKey(), entry.getValue());
+                        }
+                    }
+                    builder.addFormDataPart(
+                            fileField,
+                            videoFile.getName(),
+                            RequestBody.create(okhttp3.MediaType.parse("video/mp4"), videoFile));
+                    return builder.build();
+                }
+            case "file":
+            default:
+                {
+                    // Raw file body (e.g. presigned S3 PUT). The Content-Type MUST match exactly
+                    // what the URL was signed with: send it only when the descriptor's headers
+                    // include one. A SigV2 presigned URL is signed without Content-Type, so adding
+                    // any here makes S3 reject the PUT with SignatureDoesNotMatch (403) — hence the
+                    // null MediaType (no Content-Type header) when none is supplied.
+                    String contentType = headerValueIgnoreCase(rs.headers, "Content-Type");
+                    okhttp3.MediaType mediaType =
+                            (contentType != null && !contentType.isEmpty())
+                                    ? okhttp3.MediaType.parse(contentType)
+                                    : null;
+                    return RequestBody.create(mediaType, videoFile);
+                }
+        }
+    }
+
+    private static String headerValueIgnoreCase(Map<String, String> headers, String name) {
+        if (headers == null) {
+            return null;
+        }
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if (name.equalsIgnoreCase(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return null;
     }
 
     /** Upload media to AugmentOS Cloud */

@@ -50,6 +50,16 @@ public interface IMediaManager {
         sendVideoRecordingStatusResponse(success, statusObject);
     }
 
+    /**
+     * Send an immediate acknowledgment that a stop-recording command was received and accepted.
+     * Wire type is "stop_video_recording_ack". This confirms reception/acceptance only — it does NOT
+     * wait for the recorder to stop or the upload to finish. Safe to call repeatedly for the same
+     * requestId (the phone uses it to stop retrying a stop command that may have been lost on BLE).
+     *
+     * @param requestId The requestId from the stop command being acknowledged.
+     */
+    default void sendStopRecordingAck(String requestId) {}
+
     /** Get the shared streaming status callback instance */
     StreamingStatusCallback getStreamingStatusCallback();
 
