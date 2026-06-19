@@ -33,6 +33,11 @@ class MentraBluetoothSdk private constructor(
     private val pendingPhotoRequests = ConcurrentHashMap<String, PendingResponse<PhotoResponseEvent>>()
     private val pendingVideoRecordingRequests =
         ConcurrentHashMap<String, PendingVideoRecordingRequest>()
+    // App-level acceptance ACK for stop_video_recording, keyed by requestId. Distinct from the
+    // transport-level mId/msg_ack (which only confirms the framed message arrived): this confirms the
+    // glasses' command handler accepted the stop and is stopping/uploading. See stopVideoRecording.
+    private val pendingStopRecordingAcks =
+        ConcurrentHashMap<String, PendingResponse<StopRecordingAckEvent>>()
     private val pendingRgbLedRequests = ConcurrentHashMap<String, PendingResponse<RgbLedControlResponseEvent>>()
     private val pendingSettingsRequests = ConcurrentHashMap<String, PendingResponse<SettingsAckEvent>>()
     private val pendingStreamStarts = ConcurrentHashMap<String, PendingResponse<StreamStatusEvent>>()
@@ -67,6 +72,10 @@ class MentraBluetoothSdk private constructor(
         private const val DEFAULT_SCAN_TIMEOUT_MS = 15_000L
         private const val DEFAULT_REQUEST_TIMEOUT_MS = 15_000L
         private const val VIDEO_UPLOAD_STOP_TIMEOUT_MS = 10 * 60 * 1000L
+        // Reliable stop delivery: how long to wait for the glasses' stop_video_recording_ack before
+        // resending the stop command, and how many times to resend before giving up.
+        private const val DEFAULT_STOP_ACK_TIMEOUT_MS = 3_000L
+        private const val DEFAULT_STOP_MAX_RETRIES = 3
         private const val STREAM_START_TIMEOUT_MS = 30_000L
         private const val STREAM_STOP_TIMEOUT_MS = 15_000L
         private const val OTA_BES_VERSION_WAIT_MS = 5_000L
@@ -902,6 +911,62 @@ class MentraBluetoothSdk private constructor(
         }
     }
 
+    /**
+     * Stop recording with a delivery guarantee. Sends stop_video_recording, waits up to
+     * [ackTimeoutMs] for the glasses' stop_video_recording_ack, and resends up to [maxRetries] more
+     * times if no ACK arrives. Returns as soon as the glasses confirm they accepted the stop.
+     *
+     * The ACK confirms reception/acceptance only — it does NOT wait for the recording to finish
+     * stopping or for the upload to complete (those are reported separately via
+     * video_recording_status). The glasses dedupe by requestId, so the resends here (and any
+     * lower-level mId retransmits) never start a second recording-stop or a duplicate upload.
+     *
+     * @throws BluetoothException with code "stop_ack_timeout" if no ACK arrives after all attempts.
+     */
+    @JvmOverloads
+    fun stopVideoRecordingReliably(
+            requestId: String,
+            webhookUrl: String? = null,
+            authToken: String? = null,
+            ackTimeoutMs: Long = DEFAULT_STOP_ACK_TIMEOUT_MS,
+            maxRetries: Int = DEFAULT_STOP_MAX_RETRIES,
+    ): StopRecordingAckEvent {
+        require(requestId.isNotBlank()) { "requestId is required to stop video recording." }
+        requireGlassesConnected("stop video recording")
+
+        val pending = PendingResponse<StopRecordingAckEvent>("stop video recording ack")
+        if (pendingStopRecordingAcks.putIfAbsent(requestId, pending) != null) {
+            throw BluetoothException(
+                "request_in_flight",
+                "A stop video recording command is already waiting for requestId $requestId.",
+            )
+        }
+        try {
+            // Initial send + up to maxRetries resends. The same PendingResponse is awaited across
+            // attempts, so an ACK arriving for any attempt resolves it (and a later await returns
+            // immediately).
+            val totalAttempts = maxRetries.coerceAtLeast(0) + 1
+            for (attempt in 1..totalAttempts) {
+                deviceManager.stopVideoRecording(requestId, webhookUrl, authToken)
+                try {
+                    return pending.await(ackTimeoutMs)
+                } catch (e: BluetoothException) {
+                    if (e.code != "request_timeout") throw e
+                    Bridge.log(
+                        "SDK: stop_video_recording ACK timeout for $requestId " +
+                            "(attempt $attempt/$totalAttempts)"
+                    )
+                }
+            }
+            throw BluetoothException(
+                "stop_ack_timeout",
+                "No stop_video_recording_ack from glasses for $requestId after $totalAttempts attempts.",
+            )
+        } finally {
+            pendingStopRecordingAcks.remove(requestId, pending)
+        }
+    }
+
     fun requestVersionInfo(): VersionInfoResult {
         val pending = PendingResponse<VersionInfoResult>("version info request")
         synchronized(oneShotLock) {
@@ -1318,6 +1383,10 @@ class MentraBluetoothSdk private constructor(
                 val event = VideoRecordingStatusEvent(data)
                 handleVideoRecordingStatusForRequests(event)
                 dispatchToListeners { it.onVideoRecordingStatus(event) }
+            }
+            "stop_video_recording_ack" -> {
+                val event = StopRecordingAckEvent(data)
+                pendingStopRecordingAcks[event.requestId]?.resolve(event)
             }
             "media_success", "media_error" -> {
                 val event = MediaUploadEvent(data)

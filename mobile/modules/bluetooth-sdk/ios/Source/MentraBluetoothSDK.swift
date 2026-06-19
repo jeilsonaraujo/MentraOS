@@ -171,6 +171,9 @@ public final class MentraBluetoothSDK {
     private let analytics: BluetoothSdkAnalytics
     private var pendingPhotoRequests: [String: PendingResponse<PhotoResponseEvent>] = [:]
     private var pendingVideoRecordingRequests: [String: PendingVideoRecordingRequest] = [:]
+    // App-level acceptance ACK for stop_video_recording, keyed by requestId. Distinct from the
+    // transport-level mId/msg_ack: this confirms the glasses' command handler accepted the stop.
+    private var pendingStopRecordingAcks: [String: PendingResponse<StopRecordingAckEvent>] = [:]
     private var pendingRgbLedRequests: [String: PendingResponse<RgbLedControlResponseEvent>] = [:]
     private var pendingSettingsRequests: [String: PendingResponse<SettingsAckEvent>] = [:]
     private var pendingStreamStarts: [String: PendingResponse<StreamStatusEvent>] = [:]
@@ -922,7 +925,8 @@ public final class MentraBluetoothSDK {
     }
 
     public func stopVideoRecording(
-        requestId: String, webhookUrl: String? = nil, authToken: String? = nil
+        requestId: String, webhookUrl: String? = nil, authToken: String? = nil,
+        upload: [String: Any]? = nil, onComplete: [String: Any]? = nil
     ) async throws -> VideoRecordingStatusEvent {
         guard !requestId.isEmpty else {
             throw BluetoothSdkError(code: "missing_request_id", message: "requestId is required to stop video recording.")
@@ -935,13 +939,16 @@ public final class MentraBluetoothSDK {
                 message: "A video recording command is already waiting for requestId \(requestId)."
             )
         }
-        let waitForUpload = !(webhookUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        // Wait for the upload result (not just recording_stopped) whenever an upload
+        // is requested — either a generic described upload or the legacy webhook.
+        let webhookSet = !(webhookUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let waitForUpload = upload != nil || webhookSet
         pendingVideoRecordingRequests[requestId] = PendingVideoRecordingRequest(
             expectedStatus: "recording_stopped",
             pending: pending,
             waitForUpload: waitForUpload
         )
-        DeviceManager.shared.stopVideoRecording(requestId, webhookUrl, authToken)
+        DeviceManager.shared.stopVideoRecording(requestId, webhookUrl, authToken, upload, onComplete)
         do {
             let timeoutMs = waitForUpload ? videoUploadStopTimeoutMs : 15_000
             let event = try await pending.wait(timeoutMs: timeoutMs)
@@ -951,6 +958,70 @@ public final class MentraBluetoothSDK {
             pendingVideoRecordingRequests.removeValue(forKey: requestId)
             throw error
         }
+    }
+
+    /// Stop recording with a delivery guarantee. Sends stop_video_recording, waits up to
+    /// `ackTimeoutMs` for the glasses' stop_video_recording_ack, and resends up to `maxRetries` more
+    /// times if no ACK arrives. Returns as soon as the glasses confirm they accepted the stop.
+    ///
+    /// The ACK confirms reception/acceptance only — it does NOT wait for the recording to finish
+    /// stopping or for the upload to complete (those arrive separately on video_recording_status).
+    /// The glasses dedupe by requestId, so the resends here never start a duplicate upload.
+    ///
+    /// Throws `BluetoothError(code: "stop_ack_timeout")` if no ACK arrives after all attempts.
+    public func stopVideoRecordingReliably(
+        requestId: String, webhookUrl: String? = nil, authToken: String? = nil,
+        upload: [String: Any]? = nil, onComplete: [String: Any]? = nil,
+        ackTimeoutMs: Int = 3_000, maxRetries: Int = 3
+    ) async throws -> StopRecordingAckEvent {
+        guard !requestId.isEmpty else {
+            throw BluetoothError(code: "missing_request_id", message: "requestId is required to stop video recording.")
+        }
+        try requireGlassesConnected(operation: "stop video recording")
+        guard pendingStopRecordingAcks[requestId] == nil else {
+            throw BluetoothError(
+                code: "request_in_flight",
+                message: "A stop video recording command is already waiting for requestId \(requestId)."
+            )
+        }
+        // Initial send + up to maxRetries resends. A fresh PendingResponse per attempt — a timed-out
+        // one caches its failure and would re-throw immediately if reused.
+        let totalAttempts = max(0, maxRetries) + 1
+        for attempt in 1...totalAttempts {
+            let pending = PendingResponse<StopRecordingAckEvent>(operation: "stop video recording ack \(requestId)")
+            pendingStopRecordingAcks[requestId] = pending
+            DeviceManager.shared.stopVideoRecording(requestId, webhookUrl, authToken, upload, onComplete)
+            do {
+                let event = try await pending.wait(timeoutMs: ackTimeoutMs)
+                pendingStopRecordingAcks.removeValue(forKey: requestId)
+                return event
+            } catch let error as BluetoothError where error.code == "request_timeout" {
+                Bridge.log("SDK: stop_video_recording ACK timeout for \(requestId) (attempt \(attempt)/\(totalAttempts))")
+            } catch {
+                pendingStopRecordingAcks.removeValue(forKey: requestId)
+                throw error
+            }
+        }
+        pendingStopRecordingAcks.removeValue(forKey: requestId)
+        throw BluetoothError(
+            code: "stop_ack_timeout",
+            message: "No stop_video_recording_ack from glasses for \(requestId) after \(totalAttempts) attempts."
+        )
+    }
+
+    /// Re-upload an already-recorded clip (identified by `requestId`) via a generic `upload`
+    /// descriptor — used to retry an upload that failed earlier. Fire-and-forget: the glasses
+    /// still hold the clip and run the described upload again; progress and the final result
+    /// arrive on the video-recording-status events (upload_started / uploading / upload_completed
+    /// / upload_failed), not as a return value.
+    public func uploadVideo(
+        requestId: String, upload: [String: Any]?, onComplete: [String: Any]? = nil
+    ) throws {
+        guard !requestId.isEmpty else {
+            throw BluetoothError(code: "missing_request_id", message: "requestId is required to upload video.")
+        }
+        try requireGlassesConnected(operation: "upload video")
+        DeviceManager.shared.uploadVideo(requestId, upload, onComplete)
     }
 
     public func requestVersionInfo() async throws -> VersionInfoResult {
@@ -1765,6 +1836,9 @@ public final class MentraBluetoothSDK {
             let event = VideoRecordingStatusEvent(values: data)
             handleVideoRecordingStatusForRequests(event)
             delegate?.mentraBluetoothSDK(self, didReceive: .videoRecordingStatus(event))
+        case "stop_video_recording_ack":
+            let event = StopRecordingAckEvent(values: data)
+            pendingStopRecordingAcks[event.requestId]?.resolve(event)
         case "media_success", "media_error":
             let event = MediaUploadEvent(values: data)
             handleMediaUploadForRequests(event)

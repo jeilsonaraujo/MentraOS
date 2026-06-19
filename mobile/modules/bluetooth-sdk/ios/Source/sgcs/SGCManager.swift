@@ -32,12 +32,21 @@ protocol SGCManager {
         maxRecordingTimeMinutes: Int
     )
     func stopVideoRecording(requestId: String)
-    /// Stop recording and upload the result to `webhookUrl` (multipart) using
-    /// `authToken`. Supplied at stop time so the token is fresh when the upload
-    /// runs. Defaulted in an extension to ignore the upload target and just stop;
-    /// devices that support webhook upload (e.g. Mentra Live) override this. An
-    /// empty/nil `webhookUrl` means "keep the video on device".
-    func stopVideoRecording(requestId: String, webhookUrl: String?, authToken: String?)
+    /// Stop recording and upload the result. `upload` is a generic app-described
+    /// request (method/url/headers/body) the device executes verbatim — e.g. a raw
+    /// PUT straight to S3 — with an optional `onComplete` follow-up fired only after
+    /// a 2xx upload; both are opaque to the SDK. `webhookUrl`/`authToken` are the
+    /// legacy multipart-webhook fallback. All are supplied at stop time so any
+    /// signed URL / token is fresh. Defaulted in an extension to ignore the upload
+    /// target and just stop; devices that support upload (e.g. Mentra Live) override
+    /// this. Empty/nil targets mean "keep the video on device".
+    func stopVideoRecording(
+        requestId: String, webhookUrl: String?, authToken: String?,
+        upload: [String: Any]?, onComplete: [String: Any]?
+    )
+    /// Re-upload an already-recorded clip (identified by requestId) via the generic `upload`
+    /// descriptor. Defaulted to a no-op; devices that support upload (e.g. Mentra Live) override.
+    func uploadVideo(requestId: String, upload: [String: Any]?, onComplete: [String: Any]?)
 
     // MARK: - Button Settings
 
@@ -165,9 +174,16 @@ extension SGCManager {
         startVideoRecording(requestId: requestId, save: save, sound: sound)
     }
 
-    func stopVideoRecording(requestId: String, webhookUrl _: String?, authToken _: String?) {
+    func stopVideoRecording(
+        requestId: String, webhookUrl _: String?, authToken _: String?,
+        upload _: [String: Any]?, onComplete _: [String: Any]?
+    ) {
         stopVideoRecording(requestId: requestId)
     }
+
+    func uploadVideo(
+        requestId _: String, upload _: [String: Any]?, onComplete _: [String: Any]?
+    ) {}
 
     // MARK: - Dashboard (default: combined wire format; Nex implements single-field)
 
