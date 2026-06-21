@@ -1308,6 +1308,9 @@ public class AsgClientService extends Service implements NetworkStateListener, T
         if (lower.contains("camera busy") || lower.contains("streaming")) return "camera_busy";
         if (lower.contains("storage")) return "storage_unavailable";
         if (lower.contains("integrity")) return "integrity_failed";
+        // Terminal upload failure after the glasses' own retries — the phone uses this to request a
+        // fresh upload target and re-issue the upload.
+        if (lower.contains("upload")) return "upload_failed";
         return "error";
     }
 

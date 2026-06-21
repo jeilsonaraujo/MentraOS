@@ -40,15 +40,54 @@ import org.json.JSONObject;
  */
 public final class UploadSpec {
 
-    /** Required main upload (the bytes). */
+    /** Main upload (the bytes) for the single-request described path. Null in the multipart path. */
     public final RequestSpec upload;
 
     /** Optional follow-up request fired only after the upload returns 2xx (may be {@code null}). */
     public final RequestSpec onComplete;
 
-    private UploadSpec(RequestSpec upload, RequestSpec onComplete) {
+    /**
+     * Resumable (S3 multipart) upload, driven by the glasses against the app's API. Non-null only
+     * when the stop command carries a {@code multipartUpload} object; then {@link #upload} is null
+     * and the caller uses the multipart executor instead of the single described request.
+     */
+    public final MultipartSpec multipart;
+
+    private UploadSpec(RequestSpec upload, RequestSpec onComplete, MultipartSpec multipart) {
         this.upload = upload;
         this.onComplete = onComplete;
+        this.multipart = multipart;
+    }
+
+    /**
+     * Bootstrap for a glasses-driven resumable multipart upload. The glasses call the app's API
+     * (authenticated with the short per-session {@code authToken}) to open the upload, fetch
+     * per-part presigned URLs, PUT each part, and complete — so a dropped Wi-Fi connection only
+     * re-sends the in-flight part. Carried on the regular {@code upload} descriptor (so it reuses
+     * the existing plumbing), flagged by {@code body == "s3_multipart"}:
+     *
+     * <pre>{@code
+     * "upload": {
+     *   "body": "s3_multipart",
+     *   "url": "https://api…",                          // apiBase
+     *   "fields": { "recordingId": "<uuid>", "authToken": "…" }
+     * }
+     * }</pre>
+     */
+    public static final class MultipartSpec {
+        /** API base URL, e.g. {@code https://dimenso-api…herokuapp.com} (no trailing slash needed). */
+        public final String apiBase;
+
+        public final String recordingId;
+
+        /** Short per-session bearer token the glasses already hold (the recording/snapshot token). */
+        public final String authToken;
+
+        MultipartSpec(String apiBase, String recordingId, String authToken) {
+            this.apiBase = apiBase;
+            this.recordingId = recordingId;
+            this.authToken = authToken;
+        }
     }
 
     /** A single described HTTP request. */
@@ -99,12 +138,33 @@ public final class UploadSpec {
         if (data == null) {
             return null;
         }
-        RequestSpec upload = parseRequest(data.optJSONObject("upload"));
+        JSONObject uploadObj = data.optJSONObject("upload");
+        // A resumable upload reuses the same `upload` descriptor, flagged by body == "s3_multipart":
+        // the app's API base goes in `url`, recordingId/authToken in `fields`. This rides the
+        // existing `upload` plumbing (no new SDK/firmware field). It takes precedence when present.
+        if (uploadObj != null && "s3_multipart".equals(uploadObj.optString("body", ""))) {
+            MultipartSpec multipart = parseMultipart(uploadObj);
+            if (multipart != null) {
+                return new UploadSpec(null, null, multipart);
+            }
+        }
+        RequestSpec upload = parseRequest(uploadObj);
         if (upload == null) {
             return null;
         }
         RequestSpec onComplete = parseRequest(data.optJSONObject("onComplete"));
-        return new UploadSpec(upload, onComplete);
+        return new UploadSpec(upload, onComplete, null);
+    }
+
+    private static MultipartSpec parseMultipart(JSONObject uploadObj) {
+        String apiBase = uploadObj.optString("url", "");
+        JSONObject fields = uploadObj.optJSONObject("fields");
+        String recordingId = (fields != null) ? fields.optString("recordingId", "") : "";
+        String authToken = (fields != null) ? fields.optString("authToken", "") : "";
+        if (apiBase.isEmpty() || recordingId.isEmpty()) {
+            return null;
+        }
+        return new MultipartSpec(apiBase, recordingId, authToken);
     }
 
     private static RequestSpec parseRequest(JSONObject o) {

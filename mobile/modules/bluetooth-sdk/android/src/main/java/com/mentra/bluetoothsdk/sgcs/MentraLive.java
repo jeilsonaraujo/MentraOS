@@ -2354,6 +2354,16 @@ public class MentraLive extends SGCManager {
                 emitVideoRecordingStatus(json);
                 break;
 
+            case "stop_video_recording_ack":
+                // App-level acceptance ACK for a reliable stop — forward so the SDK can
+                // resolve the pending stopVideoRecordingReliably (otherwise it retries needlessly).
+                try {
+                    Bridge.sendTypedMessage("stop_video_recording_ack", jsonObjectToMap(json));
+                } catch (JSONException e) {
+                    Log.e(TAG, "Failed to forward stop_video_recording_ack", e);
+                }
+                break;
+
             case "media_success":
             case "media_error":
                 try {

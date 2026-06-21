@@ -233,6 +233,109 @@ Same battery constraint as photo. `recording_started` is the successful start st
 
 If `requestId` is provided, the capture service validates it matches the active recording. Status values: `recording_stopped`, `not_recording`, `service_unavailable`, `error`.
 
+The glasses reply with a [`stop_video_recording_ack`](#stop_video_recording_ack) **immediately** when the stop is accepted — before the recorder stops or any upload runs. The phone resends the same `stop_video_recording` (same `requestId`) until it sees that ACK, because either the command or the ACK can be dropped on BLE. The glasses dedupe by `requestId`, so a resent stop only re-ACKs; it never stops or uploads twice.
+
+##### Upload target (optional)
+
+A stop may carry an upload target so the just-recorded clip is uploaded off the glasses. It is supplied at **stop** (not start) so any signed URL / token is still fresh when the upload runs — a recording can last arbitrarily long. Two shapes are supported, in priority order:
+
+**1. Generic app-described upload** (`upload`, optional `onComplete`). The phone/backend dictates the exact HTTP request(s); the firmware executes them verbatim and knows nothing about the destination (e.g. a raw `PUT` straight to S3, which sidesteps the app server entirely).
+
+```json
+{
+  "type": "stop_video_recording",
+  "requestId": "video_001",
+  "upload": {
+    "method": "PUT",
+    "url": "https://bucket.s3.amazonaws.com/clip.mp4?X-Amz-Signature=...",
+    "headers": {"Content-Type": "video/mp4"},
+    "body": "file"
+  },
+  "onComplete": {
+    "method": "POST",
+    "url": "https://api.example.com/recordings/123/segments/complete",
+    "headers": {"Authorization": "Bearer ..."},
+    "body": "json",
+    "json": {"requestId": "video_001", "key": "clip.mp4"}
+  }
+}
+```
+
+| Field             | Type          | Default | Description                                                                                                                              |
+| ----------------- | ------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `upload.method`   | string        | `POST`  | HTTP method for the upload (`PUT` / `POST`).                                                                                            |
+| `upload.url`      | string        | —       | Destination URL. Required; an empty/missing url disables the described upload (falls back to the webhook below).                         |
+| `upload.body`     | string        | `file`  | Body shape: `file` (raw bytes), `multipart`, `json`, or `s3_multipart` (resumable — see below).                                         |
+| `upload.headers`  | object        | none    | Extra request headers. For `body: "file"`, omit `Content-Type` unless the signed URL requires it — a SigV2 presigned `PUT` is signed without it, so adding one is rejected with `SignatureDoesNotMatch`. |
+| `upload.fileField`| string        | `video` | `multipart` only: form field name for the file part (appended last).                                                                    |
+| `upload.fields`   | object        | none    | `multipart` only: extra string form fields.                                                                                            |
+| `upload.json`     | object/string | none    | `json` only: request body (an object is serialized to a string).                                                                       |
+| `onComplete`      | object        | none    | Optional follow-up request — same shape as `upload` — fired only after the upload returns `2xx` (e.g. to register the segment).         |
+
+**Resumable variant — `body: "s3_multipart"`.** For long clips on flaky Wi-Fi, the `upload` descriptor can instead bootstrap a glasses-driven **S3 multipart** upload, which takes precedence over the single request above. The glasses call the app's API to open the upload, fetch a presigned `PUT` URL per part, upload each part (retrying just the in-flight part on a drop), then complete — so a dropped connection only re-sends one part, not the whole clip.
+
+```json
+{
+  "type": "stop_video_recording",
+  "requestId": "video_001",
+  "upload": {
+    "body": "s3_multipart",
+    "url": "https://api.example.com",
+    "fields": {"recordingId": "<uuid>", "authToken": "<short-lived bearer>"}
+  }
+}
+```
+
+| Field                       | Type   | Description                                                              |
+| --------------------------- | ------ | ----------------------------------------------------------------------- |
+| `upload.body`               | string | Must be `"s3_multipart"` to select this path.                           |
+| `upload.url`                | string | API **base** URL (no trailing slash needed). Required.                  |
+| `upload.fields.recordingId` | string | Recording id the API keys the upload by. Required.                      |
+| `upload.fields.authToken`   | string | Bearer token the glasses send as `Authorization: Bearer <token>`.       |
+
+The glasses drive this contract against the app API (every step is a `POST` with the bearer token; `base` = `<url>/recordings/<recordingId>/segments/multipart`):
+
+| Step      | Request                                                                                  | Response / effect                       |
+| --------- | --------------------------------------------------------------------------------------- | --------------------------------------- |
+| initiate  | `POST {base}` with `{}`                                                                  | `{segment_index, upload_id, part_size}` |
+| part URLs | `POST {base}/part-urls` with `{segment_index, upload_id, part_numbers: [1..N]}`          | `{urls: {"1": "<presigned PUT>", …}}`   |
+| upload    | glasses `PUT` each presigned URL with that part's bytes                                  | per-part `ETag` header collected        |
+| complete  | `POST {base}/complete` with `{segment_index, upload_id, parts: [{part_number, etag}, …]}` | final object assembled                 |
+| abort     | `POST {base}/abort` with `{segment_index, upload_id}`                                    | sent on terminal failure so S3 drops the orphaned parts |
+
+Each part is retried independently (transient/`5xx`, up to 6 attempts with capped backoff) to ride out brief DNS/network blips; there is no overall call deadline. Progress is reported at part granularity through the same `uploading` status.
+
+**2. Legacy multipart webhook** (`webhookUrl` + `authToken`) — used only when no `upload` descriptor is present. The clip is POSTed as multipart form-data; `authToken` becomes `Authorization: Bearer <token>`. An empty/missing `webhookUrl` keeps the video on device (no upload).
+
+Upload progress and result are reported on `video_recording_status`: `upload_started`, then `uploading` with `{progress, bytesSent, bytesTotal}` (throttled, every ~5%), then `upload_completed`, or `error` / `upload_failed` on failure. The glasses retry transient failures internally (network errors, plus transient `5xx` on the idempotent upload and per-part on `s3_multipart`); on a terminal upload failure the clip is **kept on device** so it can be re-uploaded with [`upload_video`](#upload_video).
+
+##### `stop_video_recording_ack`
+
+Immediate acknowledgment that a stop command was received and accepted. Confirms reception/acceptance only — it does **not** wait for the recorder to stop or the upload to finish. Safe to receive repeatedly for the same `requestId`.
+
+```json
+{"type": "stop_video_recording_ack", "requestId": "video_001", "status": "accepted", "timestamp": 1708963201234}
+```
+
+#### `upload_video`
+
+Re-upload an already-recorded clip that is still on the glasses (located by `requestId`) — used to retry an upload that failed after `stop_video_recording`. Carries the same generic `upload` / `onComplete` descriptor as the stop command.
+
+```json
+{
+  "type": "upload_video",
+  "requestId": "video_001",
+  "upload": {
+    "method": "PUT",
+    "url": "https://bucket.s3.amazonaws.com/clip.mp4?X-Amz-Signature=...",
+    "headers": {"Content-Type": "video/mp4"},
+    "body": "file"
+  }
+}
+```
+
+Both `requestId` and a valid `upload` descriptor are required (the `s3_multipart` variant works here too). Progress and result arrive on `video_recording_status` exactly as for a stop-time upload. Failure statuses: `service_unavailable`, `invalid_upload_request`, `error`, `upload_failed`. If no matching clip is found on device, an `error` media response is sent. When several capture dirs share the `requestId` (e.g. an aborted attempt plus the real one), the glasses upload the **largest** clip.
+
 #### `get_video_recording_status`
 
 ```json

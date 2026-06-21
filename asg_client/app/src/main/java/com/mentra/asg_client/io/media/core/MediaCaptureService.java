@@ -7,6 +7,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import androidx.annotation.NonNull;
+import com.mentra.asg_client.NetworkUtils;
 import com.mentra.asg_client.audio.AudioAssets;
 import com.mentra.asg_client.camera.CameraNeoService;
 import com.mentra.asg_client.camera.lifecycle.PhotoExifMetadataWriter;
@@ -1006,7 +1007,15 @@ public class MediaCaptureService {
                                                                                     filePath);
                                                                 }
                                                                 sendGalleryStatusUpdate();
-                                                                if (uploadSpec != null) {
+                                                                if (uploadSpec != null
+                                                                        && uploadSpec.multipart
+                                                                                != null) {
+                                                                    performMultipartUpload(
+                                                                            filePath,
+                                                                            pendingRequestId,
+                                                                            uploadSpec.multipart,
+                                                                            save);
+                                                                } else if (uploadSpec != null) {
                                                                     performDescribedUpload(
                                                                             filePath,
                                                                             pendingRequestId,
@@ -2951,7 +2960,11 @@ public class MediaCaptureService {
             return;
         }
         Log.d(TAG, "🔁 Re-uploading clip for " + requestId + ": " + clip.getAbsolutePath());
-        performDescribedUpload(clip.getAbsolutePath(), requestId, spec, /* save= */ true);
+        if (spec.multipart != null) {
+            performMultipartUpload(clip.getAbsolutePath(), requestId, spec.multipart, /* save= */ true);
+        } else {
+            performDescribedUpload(clip.getAbsolutePath(), requestId, spec, /* save= */ true);
+        }
     }
 
     /**
@@ -2968,17 +2981,24 @@ public class MediaCaptureService {
         if (dirs == null) {
             return null;
         }
+        // A start-retry (the phone re-issues the same requestId until the glasses accept) can leave
+        // several capture dirs with the same requestId suffix: aborted 0-byte attempts plus the real
+        // recording. Pick the LARGEST base.mp4 so a re-upload never grabs an empty/abandoned clip
+        // (the cause of "file missing or empty" on retry → a lost segment).
+        File best = null;
+        long bestSize = 0;
         for (File dir : dirs) {
             if (dir.isDirectory()
                     && dir.getName().startsWith("VID_")
                     && dir.getName().endsWith(requestId)) {
                 File base = new File(dir, "base.mp4");
-                if (base.exists()) {
-                    return base;
+                if (base.exists() && base.length() > bestSize) {
+                    best = base;
+                    bestSize = base.length();
                 }
             }
         }
-        return null;
+        return best;
     }
 
     /** Upload a video file to AugmentOS Cloud Currently a stub - videos are kept on device */
@@ -3218,9 +3238,11 @@ public class MediaCaptureService {
                                 }
                                 Log.d(TAG, "📊 Video file size: " + videoFile.length() + " bytes");
 
-                                // 1) Main upload (the bytes) — e.g. raw PUT to S3.
+                                // 1) Main upload (the bytes) — e.g. raw PUT to S3. Idempotent, so
+                                // retry transient 5xx in addition to network errors.
                                 int uploadCode =
-                                        executeDescribedRequest(spec.upload, videoFile, requestId);
+                                        executeDescribedRequest(
+                                                spec.upload, videoFile, requestId, true);
                                 if (uploadCode < 200 || uploadCode >= 300) {
                                     failDescribedUpload(
                                             requestId,
@@ -3230,9 +3252,11 @@ public class MediaCaptureService {
 
                                 // 2) Optional completion callback (e.g. register the segment).
                                 if (spec.onComplete != null) {
+                                    // Non-idempotent (e.g. registers the segment) — never retry on a
+                                    // received status, only on a network failure.
                                     int doneCode =
                                             executeDescribedRequest(
-                                                    spec.onComplete, videoFile, null);
+                                                    spec.onComplete, videoFile, null, false);
                                     if (doneCode < 200 || doneCode >= 300) {
                                         failDescribedUpload(
                                                 requestId,
@@ -3283,15 +3307,389 @@ public class MediaCaptureService {
     }
 
     /**
+     * Attempts per individual part — the per-part retry is what makes a Wi-Fi drop cheap. Sized to
+     * ride out the glasses' flaky DNS ("Unable to resolve host …s3.amazonaws.com" for a few seconds
+     * at a time): 6 attempts with a capped backoff give a ~25s window before a part is given up on.
+     */
+    private static final int MULTIPART_PART_MAX_ATTEMPTS = 6;
+
+    /**
+     * Overall wall-clock budget for one segment's multipart upload. The upload RESUMES across Wi-Fi
+     * drops — it keeps the same S3 uploadId and only re-sends the parts still missing — so this is
+     * how long we keep riding out a flapping link before giving up and reporting {@code
+     * upload_failed} (the phone may then re-initiate from scratch as a last resort).
+     */
+    private static final long MULTIPART_TOTAL_DEADLINE_MS = 15L * 60L * 1000L;
+
+    /** Consecutive rounds that upload zero parts before we conclude the link is dead and give up. */
+    private static final int MULTIPART_MAX_BARREN_ROUNDS = 12;
+
+    /**
+     * Resumable (S3 multipart) upload, glasses-driven against the app's API. We open the upload once
+     * and then loop until every part is done: each round waits for Wi-Fi, fetches presigned PUT URLs
+     * for only the parts still missing, and PUTs them — keeping the same uploadId alive across Wi-Fi
+     * drops so a disconnect costs only the in-flight part, never the whole clip. Runs on a background
+     * thread. Only after the overall {@link #MULTIPART_TOTAL_DEADLINE_MS} budget (or repeated
+     * zero-progress rounds) is the upload aborted (so S3 drops the orphaned parts) and reported as
+     * {@code upload_failed}.
+     */
+    private void performMultipartUpload(
+            String videoFilePath, String requestId, UploadSpec.MultipartSpec mp, boolean save) {
+        Log.d(TAG, "📤 Starting multipart (resumable) video upload for: " + requestId);
+        if (mMediaCaptureListener != null) {
+            mMediaCaptureListener.onVideoUploading(requestId);
+        }
+        new Thread(
+                        () -> {
+                            File videoFile = new File(videoFilePath);
+                            long fileSize = videoFile.length();
+                            if (!videoFile.exists() || fileSize <= 0) {
+                                failDescribedUpload(
+                                        requestId, "Video upload error: file missing or empty");
+                                return;
+                            }
+
+                            String base =
+                                    mp.apiBase.endsWith("/")
+                                            ? mp.apiBase.substring(0, mp.apiBase.length() - 1)
+                                            : mp.apiBase;
+                            String mpBase =
+                                    base + "/recordings/" + mp.recordingId + "/segments/multipart";
+
+                            // No overall call deadline: each part PUT is bounded by write/read
+                            // timeouts, but a multi-minute clip on a slow link shouldn't be aborted.
+                            OkHttpClient client =
+                                    new OkHttpClient.Builder()
+                                            .protocols(
+                                                    Collections.singletonList(
+                                                            okhttp3.Protocol.HTTP_1_1))
+                                            .connectTimeout(
+                                                    10, java.util.concurrent.TimeUnit.SECONDS)
+                                            .writeTimeout(
+                                                    120, java.util.concurrent.TimeUnit.SECONDS)
+                                            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                                            .callTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
+                                            .build();
+
+                            int segmentIndex = 0;
+                            String uploadId = "";
+                            long partSize = 0;
+                            try {
+                                // 1) Initiate the multipart upload.
+                                JSONObject init =
+                                        mpPostJson(client, mp.authToken, mpBase, new JSONObject());
+                                segmentIndex = init.getInt("segment_index");
+                                uploadId = init.getString("upload_id");
+                                partSize = init.getLong("part_size");
+                                if (uploadId.isEmpty() || partSize <= 0) {
+                                    throw new java.io.IOException("Invalid initiate response");
+                                }
+                            } catch (Exception e) {
+                                failDescribedUpload(
+                                        requestId,
+                                        "Video upload error (initiate): " + e.getMessage());
+                                return;
+                            }
+
+                            int partCount = (int) ((fileSize + partSize - 1) / partSize);
+                            Log.d(
+                                    TAG,
+                                    "📊 Multipart: "
+                                            + fileSize
+                                            + " bytes, "
+                                            + partCount
+                                            + " parts of "
+                                            + partSize
+                                            + " (segment "
+                                            + segmentIndex
+                                            + ", upload "
+                                            + uploadId
+                                            + ")");
+
+                            try {
+                                // 2+3) Upload every part, RESUMING across Wi-Fi drops. Keep the same
+                                // S3 uploadId alive for the whole deadline, re-request presigned URLs
+                                // only for the parts still missing (a presigned URL can expire while
+                                // we wait), and NEVER abort on a transient failure — so a network drop
+                                // costs only the in-flight part, not the whole segment. This is what
+                                // makes the multipart upload actually resumable end-to-end.
+                                java.util.LinkedHashMap<Integer, String> doneEtags =
+                                        new java.util.LinkedHashMap<>();
+                                long deadline =
+                                        android.os.SystemClock.elapsedRealtime()
+                                                + MULTIPART_TOTAL_DEADLINE_MS;
+                                int barrenRounds = 0;
+                                java.io.RandomAccessFile raf =
+                                        new java.io.RandomAccessFile(videoFile, "r");
+                                try {
+                                    while (doneEtags.size() < partCount) {
+                                        if (android.os.SystemClock.elapsedRealtime() > deadline) {
+                                            throw new java.io.IOException(
+                                                    "Multipart deadline exceeded ("
+                                                            + doneEtags.size() + "/" + partCount
+                                                            + " parts done)");
+                                        }
+                                        // Don't burn attempts while Wi-Fi is down — the dominant
+                                        // failure is the glasses' Wi-Fi flapping, not S3. Wait for it
+                                        // to come back, then resume exactly where we left off.
+                                        if (!waitForWifi(deadline)) {
+                                            throw new java.io.IOException(
+                                                    "Wi-Fi unavailable before deadline ("
+                                                            + doneEtags.size() + "/" + partCount
+                                                            + " parts done)");
+                                        }
+
+                                        // Fresh presigned URLs for ONLY the parts still missing.
+                                        org.json.JSONArray missing = new org.json.JSONArray();
+                                        for (int p = 1; p <= partCount; p++) {
+                                            if (!doneEtags.containsKey(p)) {
+                                                missing.put(p);
+                                            }
+                                        }
+                                        JSONObject urlReq = new JSONObject();
+                                        urlReq.put("segment_index", segmentIndex);
+                                        urlReq.put("upload_id", uploadId);
+                                        urlReq.put("part_numbers", missing);
+                                        JSONObject urls =
+                                                mpPostJson(
+                                                                client, mp.authToken,
+                                                                mpBase + "/part-urls", urlReq)
+                                                        .getJSONObject("urls");
+
+                                        int uploadedThisRound = 0;
+                                        for (int i = 0; i < missing.length(); i++) {
+                                            int part = missing.getInt(i);
+                                            // If Wi-Fi just dropped, bail to the outer loop to wait +
+                                            // refresh URLs rather than spending this part's full retry
+                                            // budget against a dead link.
+                                            if (!NetworkUtils.isWifiConnected(mContext)) {
+                                                break;
+                                            }
+                                            long offset = (long) (part - 1) * partSize;
+                                            int length =
+                                                    (int) Math.min(partSize, fileSize - offset);
+                                            byte[] buf = new byte[length];
+                                            raf.seek(offset);
+                                            raf.readFully(buf);
+                                            try {
+                                                String etag =
+                                                        mpPutPart(
+                                                                client,
+                                                                urls.getString(
+                                                                        String.valueOf(part)),
+                                                                buf, part, partCount);
+                                                doneEtags.put(part, etag);
+                                                uploadedThisRound++;
+                                                reportMultipartProgress(
+                                                        requestId, doneEtags.size(), partCount,
+                                                        fileSize);
+                                            } catch (java.io.IOException partErr) {
+                                                // Part exhausted its inner retries, or its URL
+                                                // expired (4xx). Stop this round; the outer loop
+                                                // waits for Wi-Fi and re-issues fresh URLs for what
+                                                // remains. The parts already done stay on S3.
+                                                Log.w(
+                                                        TAG,
+                                                        "⚠️ Multipart part " + part
+                                                                + " unfinished this round: "
+                                                                + partErr.getMessage());
+                                                break;
+                                            }
+                                        }
+
+                                        if (uploadedThisRound == 0) {
+                                            // No forward progress this round — back off so we don't
+                                            // spin while Wi-Fi flaps, and give up if it never recovers.
+                                            if (++barrenRounds >= MULTIPART_MAX_BARREN_ROUNDS) {
+                                                throw new java.io.IOException(
+                                                        "No multipart progress after " + barrenRounds
+                                                                + " rounds (" + doneEtags.size() + "/"
+                                                                + partCount + " parts done)");
+                                            }
+                                            try {
+                                                Thread.sleep(
+                                                        Math.min(barrenRounds * 3000L, 15000L));
+                                            } catch (InterruptedException ie) {
+                                                Thread.currentThread().interrupt();
+                                                throw new java.io.IOException("Interrupted", ie);
+                                            }
+                                        } else {
+                                            barrenRounds = 0;
+                                        }
+                                    }
+                                } finally {
+                                    try {
+                                        raf.close();
+                                    } catch (Exception ignored) {
+                                    }
+                                }
+
+                                // 4) Complete — assemble the parts (in order) into the final object.
+                                org.json.JSONArray parts = new org.json.JSONArray();
+                                for (int part = 1; part <= partCount; part++) {
+                                    JSONObject p = new JSONObject();
+                                    p.put("part_number", part);
+                                    p.put("etag", doneEtags.get(part));
+                                    parts.put(p);
+                                }
+                                JSONObject doneReq = new JSONObject();
+                                doneReq.put("segment_index", segmentIndex);
+                                doneReq.put("upload_id", uploadId);
+                                doneReq.put("parts", parts);
+                                mpPostJson(client, mp.authToken, mpBase + "/complete", doneReq);
+
+                                Log.d(TAG, "✅ Multipart upload complete for " + requestId);
+                                sendMediaSuccessResponse(
+                                        requestId, mpBase, MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
+                                if (!save && videoFile.delete()) {
+                                    Log.d(TAG, "🗑️ Deleted video file after successful upload");
+                                }
+                                if (mMediaCaptureListener != null) {
+                                    mMediaCaptureListener.onVideoUploaded(requestId, mpBase);
+                                }
+                            } catch (Exception e) {
+                                Log.e(TAG, "❌ Multipart upload failed for " + requestId, e);
+                                // Best-effort abort so S3 doesn't retain the orphaned parts.
+                                try {
+                                    JSONObject abortReq = new JSONObject();
+                                    abortReq.put("segment_index", segmentIndex);
+                                    abortReq.put("upload_id", uploadId);
+                                    mpPostJson(
+                                            client, mp.authToken, mpBase + "/abort", abortReq);
+                                } catch (Exception ignored) {
+                                }
+                                failDescribedUpload(
+                                        requestId, "Video upload error: " + e.getMessage());
+                            }
+                        },
+                        "VideoMultipartUpload-" + requestId)
+                .start();
+    }
+
+    /** POST a JSON body to the app API with the bearer token; returns the parsed 2xx JSON response. */
+    private JSONObject mpPostJson(OkHttpClient client, String token, String url, JSONObject body)
+            throws java.io.IOException, org.json.JSONException {
+        RequestBody rb =
+                RequestBody.create(
+                        okhttp3.MediaType.parse("application/json; charset=utf-8"), body.toString());
+        Request.Builder b = new Request.Builder().url(url).post(rb);
+        if (token != null && !token.isEmpty()) {
+            b.header("Authorization", "Bearer " + token);
+        }
+        try (Response resp = client.newCall(b.build()).execute()) {
+            String respBody = resp.body() != null ? resp.body().string() : "";
+            if (!resp.isSuccessful()) {
+                throw new java.io.IOException("HTTP " + resp.code() + " from " + url + ": " + respBody);
+            }
+            return respBody.isEmpty() ? new JSONObject() : new JSONObject(respBody);
+        }
+    }
+
+    /** PUT one part's bytes to its presigned URL, retrying transient (network/5xx) failures. */
+    private String mpPutPart(OkHttpClient client, String url, byte[] bytes, int part, int partCount)
+            throws java.io.IOException {
+        java.io.IOException last = null;
+        for (int attempt = 1; attempt <= MULTIPART_PART_MAX_ATTEMPTS; attempt++) {
+            Request req =
+                    new Request.Builder()
+                            .url(url)
+                            .put(
+                                    RequestBody.create(
+                                            okhttp3.MediaType.parse("application/octet-stream"),
+                                            bytes))
+                            .build();
+            try (Response resp = client.newCall(req).execute()) {
+                int code = resp.code();
+                if (code >= 200 && code < 300) {
+                    String etag = resp.header("ETag");
+                    if (etag == null || etag.isEmpty()) {
+                        throw new java.io.IOException("Part " + part + " missing ETag");
+                    }
+                    return etag;
+                }
+                // 4xx is deterministic (don't hammer); 5xx is transient.
+                if (code < 500 || attempt == MULTIPART_PART_MAX_ATTEMPTS) {
+                    throw new java.io.IOException(
+                            "Part " + part + "/" + partCount + " HTTP " + code);
+                }
+                last = new java.io.IOException("Part " + part + " HTTP " + code);
+            } catch (java.io.IOException e) {
+                last = e;
+                if (attempt == MULTIPART_PART_MAX_ATTEMPTS) {
+                    break;
+                }
+            }
+            Log.w(
+                    TAG,
+                    "⚠️ Multipart part "
+                            + part
+                            + "/"
+                            + partCount
+                            + " attempt "
+                            + attempt
+                            + " failed, retrying: "
+                            + (last != null ? last.getMessage() : ""));
+            try {
+                // Capped linear backoff (2s, 4s, 6s, 6s, 6s) — long enough to outlast a DNS blip
+                // without stalling the whole 58-part upload for too long on one part.
+                Thread.sleep(Math.min(attempt * 2000L, 6000L));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new java.io.IOException("Interrupted", ie);
+            }
+        }
+        throw last != null ? last : new java.io.IOException("Part " + part + " failed");
+    }
+
+    /**
+     * Block until Wi-Fi is connected again, or until {@code deadlineElapsedRealtime} passes. Polls
+     * (rather than registering a callback) to keep the upload thread self-contained. Returns true if
+     * Wi-Fi is up so the caller can resume, false if the deadline was hit first (caller gives up).
+     */
+    private boolean waitForWifi(long deadlineElapsedRealtime) {
+        if (NetworkUtils.isWifiConnected(mContext)) {
+            return true;
+        }
+        Log.w(TAG, "📶 Wi-Fi down — pausing multipart upload until it reconnects");
+        while (android.os.SystemClock.elapsedRealtime() < deadlineElapsedRealtime) {
+            try {
+                Thread.sleep(3000L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            if (NetworkUtils.isWifiConnected(mContext)) {
+                Log.d(TAG, "📶 Wi-Fi back — resuming multipart upload");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Report multipart progress at part granularity via the existing upload-progress channel. */
+    private void reportMultipartProgress(
+            String requestId, int partsDone, int partCount, long fileSize) {
+        if (mMediaCaptureListener == null || partCount <= 0) {
+            return;
+        }
+        long bytesSent = (long) (fileSize * ((double) partsDone / partCount));
+        mMediaCaptureListener.onVideoUploadProgress(requestId, bytesSent, fileSize);
+    }
+
+    /**
      * Execute one described HTTP request, streaming the video file from disk when the body
      * references it. HTTP/1.1 is forced — it removes the HTTP/2 {@code "stream was reset:
      * NO_ERROR"} class that bites large bodies, and a single big upload gains nothing from h2.
-     * Retries only on {@link java.io.IOException} (network/stall), never on a received HTTP status,
-     * so a deterministic 4xx isn't hammered and a non-idempotent callback isn't double-fired on a
-     * real response. Returns the HTTP status code; throws the last IOException if all attempts fail.
+     * Always retries on {@link java.io.IOException} (network/stall). When {@code retryOnServerError}
+     * is set, also retries a transient {@code 5xx} — used for the idempotent main upload (a raw S3
+     * PUT/POST of the same bytes). A {@code 4xx} is deterministic (bad/expired request) so it is
+     * never retried (the phone must re-issue with a fresh descriptor), and the non-idempotent
+     * {@code onComplete} callback passes {@code retryOnServerError=false} so it isn't double-fired.
+     * Returns the HTTP status code; throws the last IOException if all attempts fail on the network.
      */
     private int executeDescribedRequest(
-            UploadSpec.RequestSpec rs, File videoFile, String progressRequestId)
+            UploadSpec.RequestSpec rs, File videoFile, String progressRequestId,
+            boolean retryOnServerError)
             throws java.io.IOException {
         RequestBody body = buildDescribedBody(rs, videoFile);
         if (progressRequestId != null) {
@@ -3344,6 +3742,32 @@ public class MediaCaptureService {
                                 + "/"
                                 + UPLOAD_MAX_ATTEMPTS
                                 + ")");
+                // Transient server error on an idempotent request → back off and retry, just like a
+                // network failure. The last attempt falls through and returns the code so the caller
+                // reports the real terminal status to the phone.
+                if (retryOnServerError
+                        && code >= 500
+                        && code < 600
+                        && attempt < UPLOAD_MAX_ATTEMPTS) {
+                    Log.w(
+                            TAG,
+                            "⚠️ [described] "
+                                    + method
+                                    + " -> "
+                                    + code
+                                    + " (server error), retrying (attempt "
+                                    + attempt
+                                    + "/"
+                                    + UPLOAD_MAX_ATTEMPTS
+                                    + ")");
+                    try {
+                        Thread.sleep(attempt * 1000L); // simple linear backoff
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new java.io.IOException("Upload interrupted", ie);
+                    }
+                    continue;
+                }
                 return code;
             } catch (java.io.IOException e) {
                 last = e;
