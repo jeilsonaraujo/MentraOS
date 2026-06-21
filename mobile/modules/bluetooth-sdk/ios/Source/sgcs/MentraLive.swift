@@ -2166,6 +2166,11 @@ class MentraLive: NSObject, SGCManager {
         case "video_recording_status":
             emitVideoRecordingStatus(json)
 
+        case "stop_video_recording_ack":
+            // App-level acceptance ACK for a reliable stop — forward so the SDK can
+            // resolve the pending stopVideoRecordingReliably (otherwise it retries needlessly).
+            Bridge.sendTypedMessage("stop_video_recording_ack", body: json)
+
         case "media_success", "media_error":
             Bridge.sendMediaUploadEvent(type: type, values: json)
 
@@ -5418,6 +5423,18 @@ extension MentraLive {
             json["onComplete"] = onComplete
         }
         sendJson(json)
+    }
+
+    func deleteVideo(requestId: String) {
+        Bridge.log("Deleting recorded video on glasses: requestId=\(requestId)")
+        guard connectionState == ConnTypes.CONNECTED else {
+            Bridge.log("Cannot delete video - not connected")
+            return
+        }
+        sendJson([
+            "type": "delete_video",
+            "requestId": requestId,
+        ])
     }
 }
 

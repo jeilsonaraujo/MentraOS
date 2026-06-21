@@ -40,7 +40,7 @@ import org.json.JSONObject;
  */
 public final class UploadSpec {
 
-    /** Required main upload (the bytes). */
+    /** Main upload (the bytes) for the single-request described path. */
     public final RequestSpec upload;
 
     /** Optional follow-up request fired only after the upload returns 2xx (may be {@code null}). */

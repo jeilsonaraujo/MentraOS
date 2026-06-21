@@ -2996,17 +2996,24 @@ public class MediaCaptureService {
         if (dirs == null) {
             return null;
         }
+        // A start-retry (the phone re-issues the same requestId until the glasses accept) can leave
+        // several capture dirs with the same requestId suffix: aborted 0-byte attempts plus the real
+        // recording. Pick the LARGEST base.mp4 so a re-upload never grabs an empty/abandoned clip
+        // (the cause of "file missing or empty" on retry → a lost segment).
+        File best = null;
+        long bestSize = 0;
         for (File dir : dirs) {
             if (dir.isDirectory()
                     && dir.getName().startsWith("VID_")
                     && dir.getName().endsWith(requestId)) {
                 File base = new File(dir, "base.mp4");
-                if (base.exists()) {
-                    return base;
+                if (base.exists() && base.length() > bestSize) {
+                    best = base;
+                    bestSize = base.length();
                 }
             }
         }
-        return null;
+        return best;
     }
 
     /** Upload a video file to AugmentOS Cloud Currently a stub - videos are kept on device */
@@ -3246,9 +3253,11 @@ public class MediaCaptureService {
                                 }
                                 Log.d(TAG, "📊 Video file size: " + videoFile.length() + " bytes");
 
-                                // 1) Main upload (the bytes) — e.g. raw PUT to S3.
+                                // 1) Main upload (the bytes) — e.g. raw PUT to S3. Idempotent, so
+                                // retry transient 5xx in addition to network errors.
                                 int uploadCode =
-                                        executeDescribedRequest(spec.upload, videoFile, requestId);
+                                        executeDescribedRequest(
+                                                spec.upload, videoFile, requestId, true);
                                 if (uploadCode < 200 || uploadCode >= 300) {
                                     failDescribedUpload(
                                             requestId,
@@ -3258,9 +3267,11 @@ public class MediaCaptureService {
 
                                 // 2) Optional completion callback (e.g. register the segment).
                                 if (spec.onComplete != null) {
+                                    // Non-idempotent (e.g. registers the segment) — never retry on a
+                                    // received status, only on a network failure.
                                     int doneCode =
                                             executeDescribedRequest(
-                                                    spec.onComplete, videoFile, null);
+                                                    spec.onComplete, videoFile, null, false);
                                     if (doneCode < 200 || doneCode >= 300) {
                                         failDescribedUpload(
                                                 requestId,
@@ -3314,12 +3325,16 @@ public class MediaCaptureService {
      * Execute one described HTTP request, streaming the video file from disk when the body
      * references it. HTTP/1.1 is forced — it removes the HTTP/2 {@code "stream was reset:
      * NO_ERROR"} class that bites large bodies, and a single big upload gains nothing from h2.
-     * Retries only on {@link java.io.IOException} (network/stall), never on a received HTTP status,
-     * so a deterministic 4xx isn't hammered and a non-idempotent callback isn't double-fired on a
-     * real response. Returns the HTTP status code; throws the last IOException if all attempts fail.
+     * Always retries on {@link java.io.IOException} (network/stall). When {@code retryOnServerError}
+     * is set, also retries a transient {@code 5xx} — used for the idempotent main upload (a raw S3
+     * PUT/POST of the same bytes). A {@code 4xx} is deterministic (bad/expired request) so it is
+     * never retried (the phone must re-issue with a fresh descriptor), and the non-idempotent
+     * {@code onComplete} callback passes {@code retryOnServerError=false} so it isn't double-fired.
+     * Returns the HTTP status code; throws the last IOException if all attempts fail on the network.
      */
     private int executeDescribedRequest(
-            UploadSpec.RequestSpec rs, File videoFile, String progressRequestId)
+            UploadSpec.RequestSpec rs, File videoFile, String progressRequestId,
+            boolean retryOnServerError)
             throws java.io.IOException {
         RequestBody body = buildDescribedBody(rs, videoFile);
         if (progressRequestId != null) {
@@ -3372,6 +3387,32 @@ public class MediaCaptureService {
                                 + "/"
                                 + UPLOAD_MAX_ATTEMPTS
                                 + ")");
+                // Transient server error on an idempotent request → back off and retry, just like a
+                // network failure. The last attempt falls through and returns the code so the caller
+                // reports the real terminal status to the phone.
+                if (retryOnServerError
+                        && code >= 500
+                        && code < 600
+                        && attempt < UPLOAD_MAX_ATTEMPTS) {
+                    Log.w(
+                            TAG,
+                            "⚠️ [described] "
+                                    + method
+                                    + " -> "
+                                    + code
+                                    + " (server error), retrying (attempt "
+                                    + attempt
+                                    + "/"
+                                    + UPLOAD_MAX_ATTEMPTS
+                                    + ")");
+                    try {
+                        Thread.sleep(attempt * 1000L); // simple linear backoff
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new java.io.IOException("Upload interrupted", ie);
+                    }
+                    continue;
+                }
                 return code;
             } catch (java.io.IOException e) {
                 last = e;
@@ -4849,5 +4890,55 @@ public class MediaCaptureService {
         } catch (Exception e) {
             Log.e(TAG, "📸 Error creating gallery status update", e);
         }
+    }
+
+    /**
+     * Delete a recorded clip (its whole capture directory) by requestId, then broadcast
+     * a fresh gallery status so the client sees the updated inventory (which doubles as
+     * the delete ack). Generic: the client — which knows the clip was safely uploaded —
+     * reclaims on-device storage by id. Skips a capture that is still recording or
+     * awaiting integrity validation as a safety guard.
+     */
+    public void deleteRecordedVideo(String requestId) {
+        if (requestId == null || requestId.isEmpty()) {
+            Log.w(TAG, "🗑️ delete_video ignored: empty requestId");
+            return;
+        }
+        File clip = findRecordedClip(requestId);
+        File captureDir = (clip != null) ? clip.getParentFile() : null;
+        if (captureDir == null) {
+            Log.d(TAG, "🗑️ delete_video: no clip on device for " + requestId);
+            sendGalleryStatusUpdate();
+            return;
+        }
+        String captureId = captureDir.getName();
+        if (captureId.equals(getActiveRecordingCaptureId())
+                || getPendingVideoIntegrityCaptureIds().contains(captureId)) {
+            Log.w(TAG, "🗑️ delete_video skipped (capture in-flight/pending): " + requestId);
+            return;
+        }
+        boolean deleted = deleteDirectoryRecursively(captureDir);
+        Log.d(
+                TAG,
+                "🗑️ delete_video " + requestId + " -> " + (deleted ? "deleted" : "failed")
+                        + " (" + captureId + ")");
+        sendGalleryStatusUpdate();
+    }
+
+    private boolean deleteDirectoryRecursively(File dir) {
+        if (dir == null) {
+            return false;
+        }
+        File[] children = dir.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                if (child.isDirectory()) {
+                    deleteDirectoryRecursively(child);
+                } else if (!child.delete()) {
+                    Log.w(TAG, "Could not delete file: " + child.getAbsolutePath());
+                }
+            }
+        }
+        return dir.delete();
     }
 }
