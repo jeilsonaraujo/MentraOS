@@ -14,6 +14,7 @@ Android application that runs on Mentra Live smart glasses, bridging hardware an
 ## Features
 
 - [Button press system](features/button-press-system.md) — camera button, gallery-mode gate, video/photo dispatch
+- [Video recording & upload](features/video-recording-and-upload.md) — reliable stop (ACK + dedup), app-described uploads, re-upload, progress
 - [Live streaming (RTMP / SRT / WHIP)](features/rtmp-streaming.md) — protocols, lifecycle, keep-alive, reconnect
 - [Camera web server](features/camera-web-server.md) — embedded HTTP server for gallery sync, downloads, deletion
 - [LED control](features/led-control.md) — local MTK recording LED + RGB ring (BES authority handoff)

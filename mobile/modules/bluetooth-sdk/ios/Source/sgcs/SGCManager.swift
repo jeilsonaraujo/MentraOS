@@ -47,6 +47,9 @@ protocol SGCManager {
     /// Re-upload an already-recorded clip (identified by requestId) via the generic `upload`
     /// descriptor. Defaulted to a no-op; devices that support upload (e.g. Mentra Live) override.
     func uploadVideo(requestId: String, upload: [String: Any]?, onComplete: [String: Any]?)
+    /// Delete an already-recorded clip (by requestId) from the glasses to reclaim storage.
+    /// Defaulted to a no-op; devices that support it (e.g. Mentra Live) override.
+    func deleteVideo(requestId: String)
 
     // MARK: - Button Settings
 
@@ -184,6 +187,8 @@ extension SGCManager {
     func uploadVideo(
         requestId _: String, upload _: [String: Any]?, onComplete _: [String: Any]?
     ) {}
+
+    func deleteVideo(requestId _: String) {}
 
     // MARK: - Dashboard (default: combined wire format; Nex implements single-field)
 

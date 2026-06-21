@@ -2,6 +2,7 @@ package com.mentra.asg_client.utils;
 
 import android.util.Log;
 import com.mentra.asg_client.io.file.core.FileManager;
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -49,6 +50,10 @@ public class GalleryStatusHelper {
 
         // Group files by capture ID to count captures, not individual files
         Set<String> countedCaptures = new HashSet<>();
+        // Per-clip inventory: lets the client reconcile which recorded clips are
+        // still on device (vs. uploaded) and command an upload/delete for a specific
+        // id. Generic: id + size + mtime only, no app/session knowledge.
+        JSONArray clips = new JSONArray();
 
         for (FileManager.FileMetadata metadata : allFiles) {
             if (!includeFile.test(metadata)) {
@@ -74,6 +79,14 @@ public class GalleryStatusHelper {
 
             if (isVideoFile(fileName.toLowerCase())) {
                 videoCount++;
+                String requestId = requestIdFromCaptureId(captureId);
+                if (requestId != null) {
+                    JSONObject clip = new JSONObject();
+                    clip.put("requestId", requestId);
+                    clip.put("size", metadata.getFileSize());
+                    clip.put("timestamp", metadata.getLastModified());
+                    clips.put(clip);
+                }
             } else {
                 photoCount++;
             }
@@ -87,6 +100,7 @@ public class GalleryStatusHelper {
         response.put("total", photoCount + videoCount);
         response.put("total_size", totalSize);
         response.put("has_content", (photoCount + videoCount) > 0);
+        response.put("clips", clips);
 
         Log.d(TAG, "Gallery status: " + photoCount + " photos, " + videoCount + " videos, " +
                    formatBytes(totalSize) + " total size");
@@ -137,6 +151,20 @@ public class GalleryStatusHelper {
         }
         stem = stem.replaceAll("_ev-?\\d+$", "");
         return stem;
+    }
+
+    /**
+     * Extract the upload requestId from a capture-folder name. Capture dirs are
+     * named {@code VID_<timestamp>_<rand>_<requestId>} where the requestId is the
+     * trailing token (it carries no underscore) — mirrors how
+     * {@code MediaCaptureService.findRecordedClip} matches {@code endsWith(requestId)}.
+     * Returns null when there is no requestId suffix.
+     */
+    private static String requestIdFromCaptureId(String captureId) {
+        if (captureId == null) return null;
+        int underscore = captureId.lastIndexOf('_');
+        if (underscore < 0 || underscore == captureId.length() - 1) return null;
+        return captureId.substring(underscore + 1);
     }
 
     /**

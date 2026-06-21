@@ -773,6 +773,31 @@ class MentraBluetoothSdk private constructor(
         }
     }
 
+    /**
+     * Re-upload an already-recorded clip ([requestId]) via a generic [upload] descriptor — used to
+     * retry an upload that failed earlier. Fire-and-forget: the glasses still hold the clip and run
+     * the described upload again; progress + final result arrive on the video-recording-status
+     * events, not as a return value.
+     */
+    fun uploadVideo(
+        requestId: String,
+        upload: Map<String, Any>?,
+        onComplete: Map<String, Any>? = null,
+    ) {
+        require(requestId.isNotEmpty()) { "requestId is required to upload video." }
+        deviceManager.uploadVideo(requestId, upload, onComplete)
+    }
+
+    /**
+     * Delete an already-recorded clip ([requestId]) from the glasses to reclaim storage — use after
+     * the clip is safely uploaded and confirmed. Fire-and-forget; the glasses broadcast a fresh
+     * gallery status (without the clip) as the ack.
+     */
+    fun deleteVideo(requestId: String) {
+        require(requestId.isNotEmpty()) { "requestId is required to delete video." }
+        deviceManager.deleteVideo(requestId)
+    }
+
     fun startStream(request: StreamRequest): StreamStatusEvent =
         startStream(request, startSdkKeepAlive = true)
 

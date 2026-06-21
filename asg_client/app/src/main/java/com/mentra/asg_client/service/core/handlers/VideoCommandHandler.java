@@ -63,7 +63,8 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
                 "start_video_recording",
                 "stop_video_recording",
                 "get_video_recording_status",
-                "upload_video");
+                "upload_video",
+                "delete_video");
     }
 
     @Override
@@ -76,6 +77,8 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
                     return handleStopCommand(data);
                 case "upload_video":
                     return handleUploadCommand(data);
+                case "delete_video":
+                    return handleDeleteCommand(data);
                 case "get_video_recording_status":
                     return handleStatusCommand(data);
                 default:
@@ -375,6 +378,33 @@ public class VideoCommandHandler extends BaseMediaCommandHandler {
             Log.e(TAG, "Error handling upload_video command", e);
             streamingManager.sendVideoRecordingStatusResponse(
                     requestId, false, "error", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Handle a delete command: remove an already-recorded clip (by requestId) from the
+     * glasses to reclaim storage. Used by the client after it has confirmed the clip is
+     * safely uploaded. Generic — just a requestId + filesystem deletion; the resulting
+     * gallery status broadcast serves as the ack.
+     */
+    public boolean handleDeleteCommand(JSONObject data) {
+        String requestId = data != null ? data.optString("requestId", "") : "";
+        try {
+            MediaCaptureService captureService = serviceManager.getMediaCaptureService();
+            if (captureService == null) {
+                Log.e(TAG, "Media capture service is not initialized");
+                return false;
+            }
+            if (requestId.isEmpty()) {
+                Log.w(TAG, "delete_video missing requestId");
+                return false;
+            }
+            Log.d(TAG, "Deleting recorded video, requestId: " + requestId);
+            captureService.deleteRecordedVideo(requestId);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Error handling delete_video command", e);
             return false;
         }
     }

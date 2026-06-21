@@ -4620,6 +4620,32 @@ class MentraLive : SGCManager() {
         }
     }
 
+    override fun uploadVideo(requestId: String, upload: Map<String, Any>?, onComplete: Map<String, Any>?) {
+        try {
+            val json = JSONObject()
+            json.put("type", "upload_video")
+            json.put("requestId", requestId)
+            if (upload != null) json.put("upload", JSONObject(upload))
+            if (onComplete != null) json.put("onComplete", JSONObject(onComplete))
+            sendJson(json, true)
+            Bridge.log("LIVE: Re-uploading existing video on glasses: requestId=$requestId")
+        } catch (e: JSONException) {
+            Log.e(TAG, "Error creating upload_video command", e)
+        }
+    }
+
+    override fun deleteVideo(requestId: String) {
+        try {
+            val json = JSONObject()
+            json.put("type", "delete_video")
+            json.put("requestId", requestId)
+            sendJson(json, true)
+            Bridge.log("LIVE: Deleting recorded video on glasses: requestId=$requestId")
+        } catch (e: JSONException) {
+            Log.e(TAG, "Error creating delete_video command", e)
+        }
+    }
+
     /**
      * Send OTA start command to glasses. Called when user approves an update (onboarding or
      * background mode). Triggers glasses to begin download and installation.

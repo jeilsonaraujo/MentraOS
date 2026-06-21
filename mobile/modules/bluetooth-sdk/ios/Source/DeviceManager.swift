@@ -1308,6 +1308,11 @@ struct ViewState {
         sgc?.uploadVideo(requestId: requestId, upload: upload, onComplete: onComplete)
     }
 
+    func deleteVideo(_ requestId: String) {
+        Bridge.log("MAN: onDeleteVideo: requestId=\(requestId)")
+        sgc?.deleteVideo(requestId: requestId)
+    }
+
     func setMicState() {
         let willSendPcm = shouldSendPcm || shouldSendLc3
         let willSendTranscript = shouldSendTranscript || offlineCaptionsRunning || localSttFallbackActive
