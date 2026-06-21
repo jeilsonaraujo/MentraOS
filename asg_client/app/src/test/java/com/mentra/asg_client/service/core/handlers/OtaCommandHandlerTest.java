@@ -2,6 +2,7 @@ package com.mentra.asg_client.service.core.handlers;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -24,10 +25,7 @@ public class OtaCommandHandlerTest {
 
         assertThat(handler.getSupportedCommandTypes())
                 .containsExactlyInAnyOrder(
-                        "ota_start",
-                        "ota_update_response",
-                        "ota_query_status",
-                        "ota_retry_version_check");
+                        "ota_start", "ota_update_response", "ota_query_status");
     }
 
     @Test
@@ -39,7 +37,66 @@ public class OtaCommandHandlerTest {
         boolean handled = handler.handleCommand("ota_start", new JSONObject());
 
         assertThat(handled).isTrue();
-        verify(otaHelper).startOtaFromPhone();
+        verify(otaHelper).startOtaFromPhone(null);
+    }
+
+    @Test
+    public void handleOtaStart_withVersionUrl_passesUrlToHelper() throws Exception {
+        OtaHelper otaHelper = mock(OtaHelper.class);
+        OtaCommandHandler handler =
+                new OtaCommandHandler(otaHelper, mock(ICommunicationManager.class));
+        String versionUrl = "https://example.com/staging_live_version.json";
+
+        boolean handled =
+                handler.handleCommand(
+                        "ota_start", new JSONObject().put("ota_version_url", versionUrl));
+
+        assertThat(handled).isTrue();
+        verify(otaHelper).startOtaFromPhone(versionUrl);
+    }
+
+    @Test
+    public void handleOtaStart_withHttpVersionUrl_passesUrlToHelper() throws Exception {
+        OtaHelper otaHelper = mock(OtaHelper.class);
+        OtaCommandHandler handler =
+                new OtaCommandHandler(otaHelper, mock(ICommunicationManager.class));
+        String versionUrl = "http://localhost:8000/staging_live_version.json";
+
+        boolean handled =
+                handler.handleCommand(
+                        "ota_start", new JSONObject().put("ota_version_url", versionUrl));
+
+        assertThat(handled).isTrue();
+        verify(otaHelper).startOtaFromPhone(versionUrl);
+    }
+
+    @Test
+    public void handleOtaStart_withEmptyVersionUrl_rejectsCommand() throws Exception {
+        OtaHelper otaHelper = mock(OtaHelper.class);
+        OtaCommandHandler handler =
+                new OtaCommandHandler(otaHelper, mock(ICommunicationManager.class));
+
+        boolean handled =
+                handler.handleCommand("ota_start", new JSONObject().put("ota_version_url", " "));
+
+        assertThat(handled).isFalse();
+        verify(otaHelper, never()).startOtaFromPhone();
+        verify(otaHelper, never()).startOtaFromPhone(null);
+    }
+
+    @Test
+    public void handleOtaStart_withNonHttpVersionUrl_rejectsCommand() throws Exception {
+        OtaHelper otaHelper = mock(OtaHelper.class);
+        OtaCommandHandler handler =
+                new OtaCommandHandler(otaHelper, mock(ICommunicationManager.class));
+
+        boolean handled =
+                handler.handleCommand(
+                        "ota_start", new JSONObject().put("ota_version_url", "file:///tmp/x"));
+
+        assertThat(handled).isFalse();
+        verify(otaHelper, never()).startOtaFromPhone();
+        verify(otaHelper, never()).startOtaFromPhone(null);
     }
 
     @Test

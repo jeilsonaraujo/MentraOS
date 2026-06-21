@@ -86,12 +86,19 @@ Capture a still photo. The handler routes through `transferMethod` to one of thr
 | `transferMethod` | string  | `"direct"`          | One of `direct`, `ble`, `auto`. `auto` requires `bleImgId`. |
 | `bleImgId`       | string  | ""                  | Required for `ble` and `auto` transfer methods              |
 | `save`           | boolean | `false`             | Also save the photo to local gallery                        |
-| `size`           | string  | `"medium"`          | `small`, `medium`, or `large`                               |
-| `compress`       | string  | `"none"`            | Compression preset passed to capture pipeline               |
-| `flash`          | boolean | `true`              | Fire the privacy LED during capture                         |
-| `sound`          | boolean | `true`              | Play shutter sound                                          |
-| `exposureTimeNs` | number  | absent              | Optional one-shot manual sensor exposure time in ns         |
-| `iso`            | number  | absent              | Optional one-shot manual sensor ISO; ignored without manual exposure |
+| `size`               | string  | `"medium"`          | `low`, `medium`, `high`, or `max` (legacy `small`→`low`, `large`→`high`, `full`→`max`) |
+| `compress`           | string  | `"none"`            | Compression preset passed to capture pipeline               |
+| `flash`              | boolean | `true`              | Fire the privacy LED during capture                         |
+| `sound`              | boolean | `true`              | Play shutter sound                                          |
+| `exposureTimeNs`     | number  | absent              | Optional one-shot manual sensor exposure time in ns         |
+| `iso`                | number  | absent              | Optional one-shot manual sensor ISO; ignored without manual exposure |
+| `aeExposureDivisor`  | number  | absent              | After AE convergence, divide metered exposure by this factor (scan tuning) |
+| `isoCap`             | number  | absent              | Cap ISO after AE metering (scan tuning)                     |
+| `noiseReduction`     | boolean | absent              | Parsed; warn-only if unsupported (`not_implemented` in metadata) |
+| `edgeEnhancement`    | boolean | absent              | `false` disables edge enhancement on still capture          |
+| `mfnr`               | boolean | absent              | `false` disables MFNR for this capture                      |
+| `ispDigitalGain`     | number  | absent              | Parsed; warn-only if unsupported                            |
+| `ispAnalogGain`      | string  | absent              | Parsed; warn-only if unsupported                            |
 
 **Constraints (all enforced in `PhotoCommandHandler`):**
 
@@ -549,7 +556,11 @@ The glasses also emit `battery_status` outbound:
 {"type": "request_version"}
 ```
 
-Returns version information chunked across three messages — `version_info_1`, `version_info_2`, `version_info_3` — to fit BLE MTU. Each chunk carries APK build, OS version, MCU/BES firmware version, and serial.
+Returns version information chunked across three messages — `version_info_1`, `version_info_2`, `version_info_3` — to fit BLE MTU:
+
+- `version_info_1`: `app_version`, `build_number`, `device_model`, `android_version`, `system_time_ms`
+- `version_info_2`: `ota_version_url` (the ASG client's compiled default OTA manifest URL)
+- `version_info_3`: `bes_fw_version`, `mtk_fw_version`, `bt_mac_address`
 
 ---
 
@@ -748,8 +759,10 @@ Persists the resolution/fps used when the hardware camera button starts a video.
 #### `button_photo_setting`
 
 ```json
-{"type": "button_photo_setting", "size": "large"}
+{"type": "button_photo_setting", "size": "high"}
 ```
+
+`size` is one of `low`, `medium`, `high`, or `max`. Legacy values `small`, `large`, and `full` are normalized on ingest.
 
 `size` is one of `small`, `medium`, `large`.
 
@@ -910,18 +923,76 @@ User accepted an OTA update.
 {"type": "ota_start"}
 ```
 
+Optionally, the phone can supply a custom manifest URL for this install attempt:
+
+```json
+{"type": "ota_start", "ota_version_url": "https://staging.ota.mentraglass.com/staging_live_version.json"}
+```
+
+When `ota_version_url` is omitted, ASG uses the compiled production default. When provided, it must be a non-empty `http` or `https` URL.
+
+On receipt, ASG sends `ota_start_ack` before version checks or downloads:
+
+```json
+{"type": "ota_start_ack", "timestamp": 1708963201234}
+```
+
+Progress, completion, and failure are reported with `ota_status`:
+
+```json
+{
+  "type": "ota_status",
+  "sid": "ota-1708963201234",
+  "ts": 3,
+  "cs": 1,
+  "st": "apk",
+  "sq": ["apk", "mtk", "bes"],
+  "phase": "download",
+  "sp": 42,
+  "op": 14,
+  "status": "in_progress"
+}
+```
+
+Compact keys keep BLE payloads small: `sid` = `session_id`, `ts` = `total_steps`, `cs` = `current_step`, `st` = `step_type`, `sq` = `step_sequence`, `sp` = `step_percent`, `op` = `overall_percent`, `err` = `error_message`. Current ASG uses `ota_status`; `ota_progress` is legacy.
+
 If `OtaHelper` isn't initialized yet (can happen right after APK install), the handler retries up to 4 times with 2 s backoff. After exhausting retries it sends:
 
 ```json
 {
-  "type": "ota_progress",
-  "stage": "download",
-  "status": "FAILED",
-  "progress": 0,
-  "bytes_downloaded": 0,
-  "total_bytes": 0,
-  "current_update": "apk",
+  "type": "ota_status",
+  "session_id": "",
+  "total_steps": 0,
+  "current_step": 0,
+  "step_type": "apk",
+  "phase": "download",
+  "step_percent": 0,
+  "overall_percent": 0,
+  "status": "failed",
   "error_message": "OTA service failed to initialize. Please restart glasses and try again."
+}
+```
+
+#### `ota_query_status`
+
+Requests the current OTA session state. ASG replies with `ota_status`; if no session is active, the status is `idle`.
+
+```json
+{"type": "ota_query_status"}
+```
+
+Idle response:
+
+```json
+{
+  "type": "ota_status",
+  "status": "idle",
+  "total_steps": 0,
+  "current_step": 0,
+  "step_type": "apk",
+  "phase": "download",
+  "step_percent": 0,
+  "overall_percent": 0
 }
 ```
 

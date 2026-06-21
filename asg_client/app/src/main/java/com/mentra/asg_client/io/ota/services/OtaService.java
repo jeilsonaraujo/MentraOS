@@ -56,9 +56,6 @@ public class OtaService extends Service {
 
         stopLegacyOtaUpdaterIfPresent();
 
-        // Clean up old firmware files from previous updates
-        cleanupOldFirmwareFiles();
-
         // Check if ASG client was just updated - if so, auto-resume OTA for MTK/BES
         checkAndResumeAfterApkUpdate();
 
@@ -67,11 +64,7 @@ public class OtaService extends Service {
             EventBus.getDefault().register(this);
         }
 
-        // OtaHelper will automatically start checking:
-        // - After 15 seconds (initial check)
-        // - Every 30 minutes (periodic checks)
-        // - When WiFi becomes available
-        Log.i(TAG, "OTA service initialized - checks will begin automatically");
+        Log.i(TAG, "OTA service initialized - waiting for phone-initiated ota_start");
     }
 
     @Override
@@ -269,7 +262,7 @@ public class OtaService extends Service {
                 // Send FAILED to phone so user knows something went wrong
                 if (otaHelper != null) {
                     otaHelper.sendMtkInstallProgressToPhone("FAILED", 0, event.getMessage());
-                    otaHelper.clearCachedArtifactsForType("mtk");
+                    otaHelper.deleteDownloadedArtifactForType("mtk");
                 }
                 break;
         }
@@ -328,25 +321,9 @@ public class OtaService extends Service {
                 // Try to notify phone of failure (might work if UART recovers)
                 if (otaHelper != null) {
                     otaHelper.sendBesInstallProgressToPhone("FAILED", 0, event.getErrorMessage());
-                    otaHelper.clearCachedArtifactsForType("bes");
+                    otaHelper.deleteDownloadedArtifactForType("bes");
                 }
                 break;
-        }
-    }
-
-    /**
-     * Clean up old firmware files from previous OTA updates. Called on service startup to remove
-     * any leftover files.
-     */
-    private void cleanupOldFirmwareFiles() {
-        try {
-            if (otaHelper != null) {
-                otaHelper.pruneInvalidCachedArtifactsOnStartup();
-            } else {
-                Log.w(TAG, "OtaHelper unavailable for cache pruning on startup");
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Error cleaning up old firmware files", e);
         }
     }
 
@@ -430,12 +407,6 @@ public class OtaService extends Service {
                 // Clear any recovery heartbeat pause that may have been set before this install.
                 OtaHelper.notifyRecoveryInstallCompleted(this);
 
-                if (otaHelper != null) {
-                    Log.i(
-                            TAG,
-                            "📱 Triggering background OTA pre-download check (first boot or update from old version)");
-                    otaHelper.startVersionCheck(this);
-                }
             } else if (currentVersion > previousVersion) {
                 Log.i(
                         TAG,
@@ -446,12 +417,6 @@ public class OtaService extends Service {
                 prefs.edit().putLong("last_seen_asg_version", currentVersion).apply();
                 OtaHelper.notifyRecoveryInstallCompleted(this);
 
-                if (otaHelper != null) {
-                    Log.i(
-                            TAG,
-                            "📱 Auto-resuming background OTA pre-download check for MTK/BES updates");
-                    otaHelper.startVersionCheck(this);
-                }
             } else {
                 Log.d(
                         TAG,

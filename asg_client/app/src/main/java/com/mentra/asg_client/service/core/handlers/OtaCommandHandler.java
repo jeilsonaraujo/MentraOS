@@ -6,6 +6,7 @@ import android.util.Log;
 import com.mentra.asg_client.io.ota.helpers.OtaHelper;
 import com.mentra.asg_client.service.communication.interfaces.ICommunicationManager;
 import com.mentra.asg_client.service.legacy.interfaces.ICommandHandler;
+import java.net.URI;
 import java.util.Set;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -19,6 +20,8 @@ import org.json.JSONObject;
  */
 public class OtaCommandHandler implements ICommandHandler {
     private static final String TAG = "OtaCommandHandler";
+    private static final String OTA_VERSION_URL_FIELD = "ota_version_url";
+    private static final String INVALID_OTA_VERSION_URL = "invalid_ota_version_url";
 
     // Retry configuration for ota_start when OtaHelper not yet initialized
     private static final int OTA_START_MAX_RETRIES = 4;
@@ -37,8 +40,7 @@ public class OtaCommandHandler implements ICommandHandler {
 
     @Override
     public Set<String> getSupportedCommandTypes() {
-        return Set.of(
-                "ota_start", "ota_update_response", "ota_query_status", "ota_retry_version_check");
+        return Set.of("ota_start", "ota_update_response", "ota_query_status");
     }
 
     @Override
@@ -51,8 +53,6 @@ public class OtaCommandHandler implements ICommandHandler {
                     return handleOtaUpdateResponse(data);
                 case "ota_query_status":
                     return handleOtaQueryStatus();
-                case "ota_retry_version_check":
-                    return handleOtaRetryVersionCheck();
                 default:
                     Log.e(TAG, "Unsupported OTA command: " + commandType);
                     return false;
@@ -107,10 +107,46 @@ public class OtaCommandHandler implements ICommandHandler {
         // Reset retry counter on success
         otaStartRetryCount = 0;
 
+        String otaVersionUrl = getValidatedOtaVersionUrl(data);
+        if (INVALID_OTA_VERSION_URL.equals(otaVersionUrl)) {
+            sendOtaError("Invalid ota_version_url. Must be a non-empty http(s) URL.");
+            return false;
+        }
+
         // Start OTA from phone request
-        otaHelper.startOtaFromPhone();
+        otaHelper.startOtaFromPhone(otaVersionUrl);
         Log.i(TAG, "📱 OTA started from phone command");
         return true;
+    }
+
+    private String getValidatedOtaVersionUrl(JSONObject data) {
+        if (data == null
+                || !data.has(OTA_VERSION_URL_FIELD)
+                || data.isNull(OTA_VERSION_URL_FIELD)) {
+            return null;
+        }
+
+        String rawUrl = data.optString(OTA_VERSION_URL_FIELD, "").trim();
+        if (rawUrl.isEmpty()) {
+            Log.w(TAG, "Rejecting ota_start with empty ota_version_url");
+            return INVALID_OTA_VERSION_URL;
+        }
+
+        try {
+            URI uri = URI.create(rawUrl);
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if ((!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))
+                    || host == null
+                    || host.isEmpty()) {
+                Log.w(TAG, "Rejecting ota_start with non-http(s) ota_version_url: " + rawUrl);
+                return INVALID_OTA_VERSION_URL;
+            }
+            return rawUrl;
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "Rejecting ota_start with malformed ota_version_url: " + rawUrl, e);
+            return INVALID_OTA_VERSION_URL;
+        }
     }
 
     /**
@@ -145,20 +181,9 @@ public class OtaCommandHandler implements ICommandHandler {
         JSONObject state = otaHelper.getOtaSessionState();
         if (state != null && communicationManager != null) {
             communicationManager.sendOtaStatus(state);
-            JSONObject data = state.optJSONObject("data");
-            String statusStr = data != null ? data.optString("status", "?") : "?";
+            String statusStr = state.optString("status", "?");
             Log.i(TAG, "📱 Sent ota_status response: " + statusStr);
         }
-        return true;
-    }
-
-    private boolean handleOtaRetryVersionCheck() {
-        Log.i(TAG, "📱 Received ota_retry_version_check from phone");
-        if (otaHelper == null) {
-            Log.w(TAG, "OtaHelper not initialized — cannot retry version check");
-            return false;
-        }
-        otaHelper.retryBackgroundVersionCheck();
         return true;
     }
 
