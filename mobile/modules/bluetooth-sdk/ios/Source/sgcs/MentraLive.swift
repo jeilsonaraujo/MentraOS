@@ -5424,6 +5424,18 @@ extension MentraLive {
         }
         sendJson(json)
     }
+
+    func deleteVideo(requestId: String) {
+        Bridge.log("Deleting recorded video on glasses: requestId=\(requestId)")
+        guard connectionState == ConnTypes.CONNECTED else {
+            Bridge.log("Cannot delete video - not connected")
+            return
+        }
+        sendJson([
+            "type": "delete_video",
+            "requestId": requestId,
+        ])
+    }
 }
 
 // MARK: - PhoneAudioMonitorListener

@@ -182,6 +182,11 @@ abstract class SGCManager {
     abstract fun queryGalleryStatus()
     abstract fun sendGalleryMode()
 
+    // Video re-upload / delete by requestId. Default no-op; devices that support it
+    // (e.g. Mentra Live) override.
+    open fun uploadVideo(requestId: String, upload: Map<String, Any>?, onComplete: Map<String, Any>?) {}
+    open fun deleteVideo(requestId: String) {}
+
     // Voice Activity Detection
     open fun sendVoiceActivityDetectionSetting() {}
 

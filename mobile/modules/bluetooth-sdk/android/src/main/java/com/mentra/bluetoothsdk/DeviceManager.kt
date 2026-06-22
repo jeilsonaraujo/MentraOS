@@ -1435,6 +1435,16 @@ class DeviceManager {
         sgc?.queryGalleryStatus()
     }
 
+    fun uploadVideo(requestId: String, upload: Map<String, Any>?, onComplete: Map<String, Any>?) {
+        Bridge.log("MAN: onUploadVideo: requestId=$requestId")
+        sgc?.uploadVideo(requestId, upload, onComplete)
+    }
+
+    fun deleteVideo(requestId: String) {
+        Bridge.log("MAN: onDeleteVideo: requestId=$requestId")
+        sgc?.deleteVideo(requestId)
+    }
+
     /**
      * Send OTA start command to glasses. Called when user approves an update (onboarding or
      * background mode). Triggers glasses to begin download and installation.
