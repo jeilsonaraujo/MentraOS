@@ -154,6 +154,10 @@ public class RtmpStreamingService extends Service {
     public void onCreate() {
         super.onCreate();
 
+        // Keep the WiFi radio at high performance for the whole streaming session
+        // (including reconnects) so power-save doesn't throttle or drop the stream.
+        WakeLockManager.acquireWifiHighPerfLock(this);
+
         boolean appliedPendingStateManager = false;
         boolean appliedPendingStreamConfig = false;
         synchronized (sConfigLock) {
@@ -274,6 +278,9 @@ public class RtmpStreamingService extends Service {
 
         // Release wake locks
         releaseWakeLocks();
+
+        // Release the WiFi high-perf lock held for the whole streaming session
+        WakeLockManager.releaseWifiHighPerfLock();
 
         // Unregister from EventBus
         if (EventBus.getDefault().isRegistered(this)) {

@@ -128,6 +128,10 @@ public class SrtStreamingService extends Service {
   public void onCreate() {
     super.onCreate();
 
+    // Keep the WiFi radio at high performance for the whole streaming session
+    // (including reconnects) so power-save doesn't throttle or drop the stream.
+    WakeLockManager.acquireWifiHighPerfLock(this);
+
     boolean appliedPendingStateManager = false;
     boolean appliedPendingStreamConfig = false;
     synchronized (sConfigLock) {
@@ -217,6 +221,9 @@ public class SrtStreamingService extends Service {
     releaseStreamer();
     releaseSurface();
     releaseWakeLocks();
+
+    // Release the WiFi high-perf lock held for the whole streaming session
+    WakeLockManager.releaseWifiHighPerfLock();
 
     if (EventBus.getDefault().isRegistered(this)) {
       EventBus.getDefault().unregister(this);

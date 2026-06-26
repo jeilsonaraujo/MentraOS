@@ -14,6 +14,7 @@ import android.util.Log;
 import androidx.preference.PreferenceManager;
 
 import com.mentra.asg_client.utils.ServerConfigUtil;
+import com.mentra.asg_client.utils.WakeLockManager;
 
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -192,12 +193,17 @@ public class MediaUploadService extends Service { // Renamed class
 
             Log.d(TAG, requestLog.toString());
 
+            // Keep the WiFi radio out of power-save for the duration of the transfer so the
+            // upload doesn't stall or drop (the glasses normally run with the screen off).
+            WakeLockManager.acquireWifiHighPerfLock(context);
+
             // Execute the request
             client.newCall(request).enqueue(new Callback() {
                 @Override
                 public void onFailure(Call call, IOException e) {
                     String errorMsg = "Network error during upload: " + e.getMessage();
                     Log.e(TAG, errorMsg);
+                    WakeLockManager.releaseWifiHighPerfLock();
                     callback.onFailure(errorMsg);
                 }
 
@@ -229,6 +235,7 @@ public class MediaUploadService extends Service { // Renamed class
                         Log.e(TAG, errorMsg);
                         callback.onFailure(errorMsg);
                     } finally {
+                        WakeLockManager.releaseWifiHighPerfLock();
                         response.close();
                     }
                 }
