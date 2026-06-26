@@ -31,6 +31,7 @@ import com.mentra.asg_client.service.system.interfaces.IStateManager;
 import com.mentra.asg_client.settings.VideoSettings;
 import com.mentra.asg_client.utils.GalleryStatusHelper;
 import com.mentra.asg_client.utils.GallerySyncFilter;
+import com.mentra.asg_client.utils.WakeLockManager;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -3072,6 +3073,9 @@ public class MediaCaptureService {
         new Thread(
                         () -> {
                             File videoFile = new File(videoFilePath);
+                            // Pin the WiFi radio to high performance for the whole upload so a
+                            // large video transfer isn't throttled or dropped by power-save.
+                            WakeLockManager.acquireWifiHighPerfLock(mContext);
                             try {
                                 if (!videoFile.exists()) {
                                     Log.e(TAG, "❌ Video file does not exist: " + videoFilePath);
@@ -3213,6 +3217,8 @@ public class MediaCaptureService {
                                             "Video upload error: " + e.getMessage(),
                                             MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
                                 }
+                            } finally {
+                                WakeLockManager.releaseWifiHighPerfLock();
                             }
                         },
                         "VideoWebhookUpload-" + requestId)
@@ -3245,6 +3251,10 @@ public class MediaCaptureService {
         new Thread(
                         () -> {
                             File videoFile = new File(videoFilePath);
+                            // Pin the WiFi radio to high performance for the whole described
+                            // upload so a large S3 transfer isn't throttled or dropped by
+                            // power-save (the glasses normally run with the screen off).
+                            WakeLockManager.acquireWifiHighPerfLock(mContext);
                             try {
                                 if (!videoFile.exists()) {
                                     failDescribedUpload(
@@ -3305,6 +3315,8 @@ public class MediaCaptureService {
                                 // Keep the file for a later retry.
                                 failDescribedUpload(
                                         requestId, "Video upload error: " + e.getMessage());
+                            } finally {
+                                WakeLockManager.releaseWifiHighPerfLock();
                             }
                         },
                         "VideoDescribedUpload-" + requestId)

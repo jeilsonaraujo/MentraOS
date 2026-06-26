@@ -1,7 +1,10 @@
 package com.mentra.asg_client.io.server.services;
 
+import android.content.Context;
 import android.media.MediaMetadataRetriever;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 
 import com.mentra.asg_client.io.server.core.AsgServer;
 import com.mentra.asg_client.io.server.interfaces.*;
@@ -10,6 +13,7 @@ import com.mentra.asg_client.io.file.core.FileManager;
 import com.mentra.asg_client.io.file.core.FileManager.FileMetadata;
 import com.mentra.asg_client.io.file.core.FileManager.FileOperationResult;
 import com.mentra.asg_client.utils.GallerySyncFilter;
+import com.mentra.asg_client.utils.WakeLockManager;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
@@ -76,6 +80,66 @@ public class AsgCameraServer extends AsgServer {
 
     private OnPictureRequestListener pictureRequestListener;
 
+    // --- WiFi high-perf lock for active glasses<->phone sync/transfers ---
+    // The phone pulls files over the endpoints below; without pinning the radio to
+    // high performance, WiFi power-save can throttle or drop the transfer mid-sync
+    // (the glasses normally run with the screen off). We acquire on the first transfer
+    // request and release a short while after the phone stops talking to us, so a whole
+    // multi-file sync stays fast without holding the radio awake when idle.
+    private static final long SYNC_WIFI_IDLE_RELEASE_MS = 20_000L;
+    private final Handler syncWifiHandler = new Handler(Looper.getMainLooper());
+    private final Object syncWifiLockGuard = new Object();
+    private boolean syncWifiLockHeld = false;
+    private final Runnable syncWifiReleaseRunnable = () -> {
+        synchronized (syncWifiLockGuard) {
+            if (syncWifiLockHeld) {
+                WakeLockManager.releaseWifiHighPerfLock();
+                syncWifiLockHeld = false;
+                logger.debug(TAG, "📶 Released WiFi high-perf lock after sync inactivity");
+            }
+        }
+    };
+
+    /**
+     * Mark that the phone is actively syncing/downloading and keep the WiFi radio at
+     * high performance for the duration. Acquires the shared {@link WakeLockManager}
+     * WiFi lock once, then (re)schedules an idle release on every transfer request so
+     * the lock spans the whole sync session but is freed once the phone goes quiet.
+     */
+    private void keepWifiAwakeForSync() {
+        try {
+            Context context = config.getContext();
+            if (context == null) {
+                return;
+            }
+            synchronized (syncWifiLockGuard) {
+                if (!syncWifiLockHeld) {
+                    WakeLockManager.acquireWifiHighPerfLock(context);
+                    syncWifiLockHeld = true;
+                    logger.debug(TAG, "📶 Acquired WiFi high-perf lock for active sync/transfer");
+                }
+            }
+            // Handler post/removeCallbacks are thread-safe; this runs from NanoHTTPD workers.
+            syncWifiHandler.removeCallbacks(syncWifiReleaseRunnable);
+            syncWifiHandler.postDelayed(syncWifiReleaseRunnable, SYNC_WIFI_IDLE_RELEASE_MS);
+        } catch (Exception e) {
+            logger.error(TAG, "📶 Error managing sync WiFi lock: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public void stopServer() {
+        // Make sure we don't leak the WiFi lock if the server is torn down mid-sync.
+        syncWifiHandler.removeCallbacks(syncWifiReleaseRunnable);
+        synchronized (syncWifiLockGuard) {
+            if (syncWifiLockHeld) {
+                WakeLockManager.releaseWifiHighPerfLock();
+                syncWifiLockHeld = false;
+            }
+        }
+        super.stopServer();
+    }
+
     /**
      * Constructor for camera web server with dependency injection.
      * Follows Dependency Inversion Principle by depending on abstractions.
@@ -117,6 +181,20 @@ public class AsgCameraServer extends AsgServer {
     @Override
     protected Response handleRequest(IHTTPSession session) {
         String uri = session.getUri();
+
+        // Keep WiFi at high performance while the phone is actively pulling media so the
+        // glasses<->phone sync doesn't stall or drop on a power-saving radio.
+        switch (uri) {
+            case "/api/sync":
+            case "/api/sync-batch":
+            case "/api/download":
+            case "/api/photo":
+            case "/api/latest-photo":
+                keepWifiAwakeForSync();
+                break;
+            default:
+                break;
+        }
 
         switch (uri) {
             case "/":

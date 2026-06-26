@@ -192,6 +192,10 @@ public class WhipStreamingService extends Service {
   public void onCreate() {
     super.onCreate();
 
+    // Keep the WiFi radio at high performance for the whole streaming session
+    // (including reconnects) so power-save doesn't throttle or drop the stream.
+    WakeLockManager.acquireWifiHighPerfLock(this);
+
     boolean appliedPendingStreamConfig = false;
     synchronized (sConfigLock) {
       if (sPendingStreamConfig != null) {
@@ -250,6 +254,10 @@ public class WhipStreamingService extends Service {
       }
     }
     stopStreaming();
+
+    // Release the WiFi high-perf lock held for the whole streaming session
+    WakeLockManager.releaseWifiHighPerfLock();
+
     Log.d(TAG, "WhipStreamingService destroyed");
     super.onDestroy();
   }

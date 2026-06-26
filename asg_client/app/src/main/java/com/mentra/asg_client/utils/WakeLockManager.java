@@ -3,6 +3,7 @@ package com.mentra.asg_client.utils;
 import android.app.ActivityManager;
 import android.content.Context;
 import android.content.Intent;
+import android.net.wifi.WifiManager;
 import android.os.PowerManager;
 import android.util.Log;
 
@@ -23,14 +24,22 @@ public class WakeLockManager {
     // Default tag prefixes for wake locks
     private static final String DEFAULT_CPU_WAKE_LOCK_TAG = "AugmentOS:CpuWakeLock";
     private static final String DEFAULT_SCREEN_WAKE_LOCK_TAG = "AugmentOS:ScreenWakeLock";
-    
+    private static final String DEFAULT_WIFI_LOCK_TAG = "AugmentOS:WifiHighPerfLock";
+
     // Default timeouts
     private static final long DEFAULT_CPU_TIMEOUT_MS = 60000; // 60 seconds
     private static final long DEFAULT_SCREEN_TIMEOUT_MS = 15000; // 15 seconds
-    
+
     // Static wake lock instances for sharing across the app
     private static PowerManager.WakeLock sCpuWakeLock;
     private static PowerManager.WakeLock sScreenWakeLock;
+
+    // High-performance WiFi lock, shared and reference-counted across the app.
+    // Keeps the WiFi radio out of power-save during sustained transfers (uploads,
+    // glasses<->phone sync, streaming). Without it, the radio can throttle or drop
+    // the connection when the screen is off (the glasses' normal state).
+    private static WifiManager.WifiLock sWifiLock;
+    private static int sWifiLockRefCount = 0;
 
     /**
      * Acquire a CPU wake lock to keep the processor running.
@@ -221,6 +230,76 @@ public class WakeLockManager {
         boolean cpuSuccess = releaseCpuWakeLock();
         boolean screenSuccess = releaseScreenWakeLock();
         return cpuSuccess && screenSuccess;
+    }
+
+    /**
+     * Acquire the shared high-performance WiFi lock to keep the WiFi radio out of
+     * power-save mode during sustained transfers. The lock is reference-counted: it
+     * stays held until every caller that acquired it has released it, so overlapping
+     * workloads (e.g. an upload while a sync is in progress) are safe.
+     *
+     * <p>Each successful call MUST be balanced by exactly one {@link #releaseWifiHighPerfLock()}.
+     * Note: WifiLock does not support timeout-based auto-release, so callers are responsible
+     * for releasing (use try/finally for synchronous work, or an idle timer for serving paths).
+     *
+     * @param context Application context
+     * @return true if the lock is held after this call
+     */
+    @SuppressWarnings("deprecation") // WIFI_MODE_FULL_HIGH_PERF is the right mode for sustained throughput
+    public static synchronized boolean acquireWifiHighPerfLock(@NonNull Context context) {
+        try {
+            if (sWifiLock == null) {
+                WifiManager wifiManager = (WifiManager)
+                        context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wifiManager == null) {
+                    Log.e(TAG, "WifiManager is null, cannot acquire WiFi lock");
+                    return false;
+                }
+                sWifiLock = wifiManager.createWifiLock(
+                        WifiManager.WIFI_MODE_FULL_HIGH_PERF, DEFAULT_WIFI_LOCK_TAG);
+                // We manage the count ourselves so a single release fully releases the lock.
+                sWifiLock.setReferenceCounted(false);
+            }
+
+            if (!sWifiLock.isHeld()) {
+                sWifiLock.acquire();
+                Log.d(TAG, "WiFi high-perf lock acquired");
+            }
+            sWifiLockRefCount++;
+            Log.d(TAG, "WiFi lock holders: " + sWifiLockRefCount);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Error acquiring WiFi high-perf lock", e);
+            return false;
+        }
+    }
+
+    /**
+     * Release one hold on the shared high-performance WiFi lock. The radio is only
+     * released back to power-save once the reference count reaches zero. Safe to call
+     * even if no lock is held (it is a no-op in that case).
+     *
+     * @return true if the operation completed without error
+     */
+    public static synchronized boolean releaseWifiHighPerfLock() {
+        try {
+            if (sWifiLockRefCount > 0) {
+                sWifiLockRefCount--;
+            }
+            Log.d(TAG, "WiFi lock holders after release: " + sWifiLockRefCount);
+
+            if (sWifiLockRefCount <= 0) {
+                sWifiLockRefCount = 0;
+                if (sWifiLock != null && sWifiLock.isHeld()) {
+                    sWifiLock.release();
+                    Log.d(TAG, "WiFi high-perf lock released");
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Error releasing WiFi high-perf lock", e);
+            return false;
+        }
     }
 
     /**
