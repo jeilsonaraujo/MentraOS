@@ -4905,6 +4905,31 @@ public class MediaCaptureService {
     }
 
     /**
+     * Locate the single capture directory ({@code VID_..._<requestId>} or
+     * {@code IMG_..._<requestId>}) named by this requestId. The requestId is unique per
+     * capture (it carries an epoch), so exactly one directory matches — this deletes only
+     * that one capture's folder, never a broad sweep. Returns null when none matches.
+     */
+    private File findCaptureDirByRequestId(String requestId) {
+        if (requestId == null || requestId.isEmpty()) {
+            return null;
+        }
+        File mediaDir = fileManager.getDefaultMediaDirectory();
+        File[] dirs = (mediaDir != null) ? mediaDir.listFiles() : null;
+        if (dirs == null) {
+            return null;
+        }
+        for (File dir : dirs) {
+            if (dir.isDirectory()
+                    && (dir.getName().startsWith("VID_") || dir.getName().startsWith("IMG_"))
+                    && dir.getName().endsWith(requestId)) {
+                return dir;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Delete a recorded clip (its whole capture directory) by requestId, then broadcast
      * a fresh gallery status so the client sees the updated inventory (which doubles as
      * the delete ack). Generic: the client — which knows the clip was safely uploaded —
@@ -4916,10 +4941,10 @@ public class MediaCaptureService {
             Log.w(TAG, "🗑️ delete_video ignored: empty requestId");
             return;
         }
-        File clip = findRecordedClip(requestId);
-        File captureDir = (clip != null) ? clip.getParentFile() : null;
+        // The requestId names exactly one capture (video or photo). Delete that one folder.
+        File captureDir = findCaptureDirByRequestId(requestId);
         if (captureDir == null) {
-            Log.d(TAG, "🗑️ delete_video: no clip on device for " + requestId);
+            Log.d(TAG, "🗑️ delete: no capture on device for " + requestId);
             sendGalleryStatusUpdate();
             return;
         }

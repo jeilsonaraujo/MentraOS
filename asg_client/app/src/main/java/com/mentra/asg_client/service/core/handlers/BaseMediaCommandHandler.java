@@ -135,9 +135,24 @@ public abstract class BaseMediaCommandHandler implements ICommandHandler {
      * @return Full file path to base file inside capture directory, or null if failed
      */
     protected String generateCaptureFilePath(String packageName, String prefix, String extension) {
+        return generateCaptureFilePath(packageName, prefix, extension, null);
+    }
+
+    /**
+     * Same as {@link #generateCaptureFilePath(String, String, String)} but appends the caller's
+     * {@code requestId} as the last '_'-separated segment of the capture directory
+     * (e.g. IMG_20250302_143022_456_789_&lt;requestId&gt;/). This mirrors how video recordings embed
+     * their requestId (VID_..._&lt;requestId&gt;), so the phone can recover which app session a synced
+     * capture belongs to from the on-glasses folder name. Pass null/empty to keep the plain name.
+     */
+    protected String generateCaptureFilePath(
+            String packageName, String prefix, String extension, String requestId) {
         String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date());
         int randomSuffix = (int)(Math.random() * 1000);
         String captureDir = prefix + timeStamp + "_" + randomSuffix;
+        if (requestId != null && !requestId.isEmpty()) {
+            captureDir += "_" + requestId;
+        }
         File packageDir = getPackageDirectory(packageName);
         if (packageDir == null) {
             return null;

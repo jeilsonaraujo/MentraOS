@@ -594,9 +594,11 @@ public class AsgCameraServer extends AsgServer {
             // download on Android (HttpURLConnection treats EOF as success).
             long fileSize = imageFile.length();
             BufferedInputStream bis = new BufferedInputStream(new FileInputStream(imageFile), 65536);
-            Response response = newFixedLengthResponse(Response.Status.OK, mimeType, bis, fileSize);
-            response.addHeader("Content-Length", String.valueOf(fileSize));
-            return response;
+            // newFixedLengthResponse already emits Content-Length for a known length.
+            // Do NOT add it again: a duplicate Content-Length header makes strict HTTP
+            // clients (e.g. Dart's http package used by the gallery-sync download)
+            // reject the response, so every /api/photo image download would fail.
+            return newFixedLengthResponse(Response.Status.OK, mimeType, bis, fileSize);
         } catch (Exception e) {
             logger.error(TAG, "🖼️ Error reading image file " + filename + ": " + e.getMessage(), e);
             return createErrorResponse(Response.Status.INTERNAL_ERROR, "Error reading image file");

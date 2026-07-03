@@ -138,9 +138,10 @@ public class PhotoCommandHandler extends BaseMediaCommandHandler {
 
             // Use the permanent gallery path only when the caller wants to save; otherwise use
             // the transient _sdk_pending tree so in-flight SDK photos are invisible to gallery
-            // sync and are cleaned up automatically after upload.
+            // sync and are cleaned up automatically after upload. For saved photos, embed the
+            // requestId in the folder name (mirrors video) so the phone can recover the session.
             String photoFilePath = save
-                    ? generateCaptureFilePath(packageName, "IMG_", ".jpg")
+                    ? generateCaptureFilePath(packageName, "IMG_", ".jpg", requestId)
                     : generateTransientCaptureFilePath(packageName, "IMG_", ".jpg");
             if (photoFilePath == null) {
                 logCommandResult("take_photo", false, "Failed to generate file path");
