@@ -74,4 +74,8 @@ data class Device(
 data class ConnectOptions(
     val saveAsDefault: Boolean = true,
     val cancelExistingConnectionAttempt: Boolean = true,
+    // When true, connectGatt uses autoConnect=true so the OS reconnects the
+    // peripheral on its own when it reappears (works while backgrounded via the
+    // SDK's foreground service). Default false preserves the direct connect.
+    val backgroundReconnect: Boolean = false,
 )

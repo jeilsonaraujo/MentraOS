@@ -5,8 +5,19 @@ public struct MentraBluetoothSDKConfiguration {
 
     public let analytics: BluetoothSdkAnalyticsConfiguration
 
-    public init(analytics: BluetoothSdkAnalyticsConfiguration = BluetoothSdkAnalyticsConfiguration()) {
+    /// When non-nil, central managers are created with
+    /// `CBCentralManagerOptionRestoreIdentifierKey` set to this value, opting
+    /// into CoreBluetooth state preservation & restoration so the system can
+    /// relaunch the app in the background to resume BLE work. Nil (default)
+    /// disables restoration — the current behavior. Opt-in and purpose-agnostic.
+    public let bluetoothRestoreIdentifier: String?
+
+    public init(
+        analytics: BluetoothSdkAnalyticsConfiguration = BluetoothSdkAnalyticsConfiguration(),
+        bluetoothRestoreIdentifier: String? = nil
+    ) {
         self.analytics = analytics
+        self.bluetoothRestoreIdentifier = bluetoothRestoreIdentifier
     }
 }
 
@@ -127,12 +138,41 @@ public struct Device: Identifiable, Equatable, CustomStringConvertible {
     }
 }
 
+/// Process-wide iOS background-reconnect switches, set by the SDK entry points
+/// and read by the CoreBluetooth controllers at manager-creation / connect time.
+/// Kept as static state — consistent with `DeviceManager.shared` /
+/// `DeviceStore.shared` — so the opt-in flags reach the controllers without
+/// threading a parameter through `connectByName` / `connectById`.
+enum BluetoothBackgroundConfig {
+    /// Non-nil enables CoreBluetooth state preservation & restoration; used as
+    /// the `CBCentralManagerOptionRestoreIdentifierKey`. Set once at SDK init,
+    /// so it is in place before any central manager is created (including on a
+    /// background relaunch, where the SDK is re-initialized early).
+    static var restoreIdentifier: String?
+
+    /// When true, connects are left pending (no app-level connection timeout) so
+    /// CoreBluetooth reconnects the peripheral on its own when it reappears,
+    /// including while the app is backgrounded. Set per `connect()` call.
+    static var backgroundReconnect: Bool = false
+}
+
 public struct ConnectOptions {
     public let saveAsDefault: Bool
     public let cancelExistingConnectionAttempt: Bool
 
-    public init(saveAsDefault: Bool = true, cancelExistingConnectionAttempt: Bool = true) {
+    /// When true, the connection request is left pending so CoreBluetooth
+    /// reconnects the peripheral on its own when it reappears — including while
+    /// the app is backgrounded — instead of giving up after the app-level
+    /// connection timeout. Default false preserves the timeout-bounded connect.
+    public let backgroundReconnect: Bool
+
+    public init(
+        saveAsDefault: Bool = true,
+        cancelExistingConnectionAttempt: Bool = true,
+        backgroundReconnect: Bool = false
+    ) {
         self.saveAsDefault = saveAsDefault
         self.cancelExistingConnectionAttempt = cancelExistingConnectionAttempt
+        self.backgroundReconnect = backgroundReconnect
     }
 }

@@ -189,6 +189,9 @@ public final class MentraBluetoothSDK {
 
     public init(configuration: MentraBluetoothSDKConfiguration = .default) {
         self.configuration = configuration
+        // Set before any central manager is created so restoration is opted into
+        // at construction time (CoreBluetooth requires the option then).
+        BluetoothBackgroundConfig.restoreIdentifier = configuration.bluetoothRestoreIdentifier
         analytics = BluetoothSdkAnalytics(configuration: configuration.analytics)
         bluetoothAvailabilityListenerId = BluetoothAvailability.shared.addStateListener { [weak self] state in
             Task { @MainActor [weak self] in
@@ -331,6 +334,7 @@ public final class MentraBluetoothSDK {
     }
 
     public func connect(to device: Device, options: ConnectOptions = ConnectOptions()) throws {
+        BluetoothBackgroundConfig.backgroundReconnect = options.backgroundReconnect
         clearBluetoothRestoreIntent()
         if device.model != .simulated {
             try BluetoothAvailability.shared.requirePoweredOn(operation: "connect to glasses")
@@ -351,6 +355,7 @@ public final class MentraBluetoothSDK {
     }
 
     public func connectDefault(options: ConnectOptions = ConnectOptions()) throws {
+        BluetoothBackgroundConfig.backgroundReconnect = options.backgroundReconnect
         clearBluetoothRestoreIntent()
         guard let device = currentDefaultDevice() else {
             throw BluetoothSdkError(

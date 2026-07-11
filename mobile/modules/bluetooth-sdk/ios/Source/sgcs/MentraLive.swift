@@ -807,9 +807,23 @@ extension MentraLive: CBCentralManagerDelegate {
             switch state {
             case .poweredOn:
                 Bridge.log("LIVE: Bluetooth powered on")
-                // If we have a saved device, try to reconnect
-                if let savedDeviceName = UserDefaults.standard.string(forKey: PREFS_DEVICE_NAME),
-                   !savedDeviceName.isEmpty
+                // Background reconnect owns the known-device path: reconnect via a
+                // retained pending connect (retrieve by saved UUID, no scan) — a
+                // background scan is never delivered while suspended, and the manager
+                // is guaranteed powered on here so retrieve works. Scan stays only as
+                // the fallback for fresh pairing (no saved UUID) or when the feature
+                // is off. This is also where willRestoreState's pending connect gets
+                // re-issued (retrieve returns the same peripheral by identifier).
+                if BluetoothBackgroundConfig.backgroundReconnect,
+                   let uuidString = UserDefaults.standard.string(forKey: PREFS_DEVICE_UUID),
+                   let uuid = UUID(uuidString: uuidString),
+                   let peripheral = central.retrievePeripherals(withIdentifiers: [uuid]).first
+                {
+                    Bridge.log("LIVE: poweredOn — retrieved known peripheral, pending connect (no scan)")
+                    if let name = peripheral.name { self.discoveredPeripherals[name] = peripheral }
+                    self.startPendingConnect(peripheral)
+                } else if let savedDeviceName = UserDefaults.standard.string(forKey: PREFS_DEVICE_NAME),
+                          !savedDeviceName.isEmpty
                 {
                     self.startScan()
                 }
@@ -828,6 +842,34 @@ extension MentraLive: CBCentralManagerDelegate {
 
             default:
                 Bridge.log("LIVE: Bluetooth state: \(state.rawValue)")
+            }
+        }
+    }
+
+    // CoreBluetooth relaunched the app to restore BLE work (state restoration,
+    // enabled only when a restore identifier was configured). Recover the
+    // peripheral we had so the connection resumes without a scan — background
+    // scans with no service filter are not delivered while suspended.
+    nonisolated func centralManager(_: CBCentralManager, willRestoreState dict: [String: Any]) {
+        let peripherals = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]) ?? []
+        Bridge.log("LIVE: willRestoreState — \(peripherals.count) peripheral(s) to restore")
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let peripheral = peripherals.first else { return }
+            if let name = peripheral.name {
+                self.discoveredPeripherals[name] = peripheral
+                UserDefaults.standard.set(name, forKey: self.PREFS_DEVICE_NAME)
+            }
+            peripheral.delegate = self
+            self.updateConnectionState(ConnTypes.CONNECTING)
+            if peripheral.state == .connected {
+                // Still connected across the relaunch — rebuild GATT state.
+                self.connectedPeripheral = peripheral
+                peripheral.discoverServices([self.SERVICE_UUID])
+            } else {
+                // Re-arm the retained pending connect so the OS reconnects it
+                // (foreground or background) and fires didConnect.
+                self.pendingReconnectPeripheral = peripheral
+                self.centralManager?.connect(peripheral, options: nil)
             }
         }
     }
@@ -875,8 +917,10 @@ extension MentraLive: CBCentralManagerDelegate {
             Bridge.log("Connected to GATT server, discovering services...")
 
             self.stopConnectionTimeout()
+            self.stopPendingConnectWatchdog()
             self.isConnecting = false
             self.connectedPeripheral = peripheral
+            self.pendingReconnectPeripheral = nil
 
             // Save device name and address for future reconnection
             if let name = peripheral.name {
@@ -884,6 +928,9 @@ extension MentraLive: CBCentralManagerDelegate {
                 Bridge.log("Saved device name for future reconnection: \(name)")
                 DeviceStore.shared.apply("glasses", "bluetoothName", name)
             }
+            // Persist the peripheral UUID so a future connect can retrieve it and
+            // reconnect via a retained pending connect (no scan) — works locked.
+            UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: PREFS_DEVICE_UUID)
             // Persist peripheral UUID so DeviceManager can sync it to RN settings
             DeviceStore.shared.apply("bluetooth", "device_address", peripheral.identifier.uuidString)
 
@@ -902,7 +949,7 @@ extension MentraLive: CBCentralManagerDelegate {
     }
 
     nonisolated func centralManager(
-        _: CBCentralManager, didDisconnectPeripheral _: CBPeripheral, error _: Error?
+        _: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error _: Error?
     ) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -924,9 +971,61 @@ extension MentraLive: CBCentralManagerDelegate {
 
             // Attempt reconnection if not killed
             if !self.isKilled {
-                self.handleReconnection()
+                if BluetoothBackgroundConfig.backgroundReconnect {
+                    // Known peripheral: leave a retained pending connect so the OS
+                    // reconnects it whenever it reappears — including while the app
+                    // is backgrounded, and (with the restore id) after relaunch.
+                    self.startPendingConnect(peripheral)
+                } else {
+                    self.handleReconnection()
+                }
             }
         }
+    }
+
+    /// Connect a known peripheral by leaving a retained, no-timeout pending
+    /// `connect` (no scan). CoreBluetooth completes it whenever the peripheral
+    /// advertises again, in the foreground OR background, and (with the restore
+    /// id) after the app is relaunched. Used for both the initial connect of a
+    /// known device and reconnection after a drop. We keep a strong ref in
+    /// [pendingReconnectPeripheral] or CoreBluetooth cancels the pending connect.
+    private func startPendingConnect(_ peripheral: CBPeripheral) {
+        reconnectAttempts = 0
+        pendingReconnectPeripheral = peripheral
+        peripheral.delegate = self
+        updateConnectionState(ConnTypes.CONNECTING)
+        Bridge.log(
+            "LIVE: retained pending connect to \(peripheral.identifier.uuidString) (no timeout, no scan)"
+        )
+        centralManager?.connect(peripheral, options: nil)
+        startPendingConnectWatchdog()
+    }
+
+    /// Recover a stuck retained pending connect. While the app is alive and the
+    /// BLE link isn't established, periodically restart the scan so the glasses
+    /// are actively rediscovered (by name, even under a new identity) and
+    /// connected — instead of waiting indefinitely on a pending connect that the
+    /// OS never completes. Skips while a connect/scan is already in flight so it
+    /// doesn't churn an in-progress attempt.
+    private func startPendingConnectWatchdog() {
+        pendingConnectWatchdog?.invalidate()
+        pendingConnectWatchdog = Timer.scheduledTimer(
+            withTimeInterval: PENDING_CONNECT_WATCHDOG_SEC, repeats: true
+        ) { [weak self] _ in
+            guard let self, !self.isKilled else { return }
+            // BLE connected already (SOC may still be booting) — the readiness
+            // loop owns it; don't disturb the GATT connection.
+            if self.connectedPeripheral != nil { return }
+            // An attempt is already in flight — let it finish or time out.
+            if self.isConnecting || self.isScanning { return }
+            Bridge.log("LIVE: pending connect watchdog — still not connected, restarting scan")
+            self.startScan()
+        }
+    }
+
+    private func stopPendingConnectWatchdog() {
+        pendingConnectWatchdog?.invalidate()
+        pendingConnectWatchdog = nil
     }
 
     nonisolated func centralManager(_: CBCentralManager, didFailToConnect _: CBPeripheral, error: Error?) {
@@ -1361,6 +1460,10 @@ class MentraLive: NSObject, SGCManager {
 
     /// Device Settings Keys
     private let PREFS_DEVICE_NAME = "MentraLiveLastConnectedDeviceName"
+    // Persisted CBPeripheral UUID of the last connected glasses. Lets us
+    // retrievePeripherals(withIdentifiers:) and issue a retained pending connect
+    // WITHOUT a scan — the only reconnect path that works while backgrounded.
+    private let PREFS_DEVICE_UUID = "MentraLiveLastConnectedDeviceUUID"
 
     // MARK: - Properties
 
@@ -1372,6 +1475,10 @@ class MentraLive: NSObject, SGCManager {
     private var centralManager: CBCentralManager?
 
     private var connectedPeripheral: CBPeripheral?
+    // Strong ref to a peripheral we've left a pending connect on (background
+    // reconnect). CoreBluetooth cancels a pending connect if the CBPeripheral is
+    // deallocated, so this MUST outlive the connect() call.
+    private var pendingReconnectPeripheral: CBPeripheral?
     private var txCharacteristic: CBCharacteristic?
     private var rxCharacteristic: CBCharacteristic?
     private let bes2700MtuLimit = 256
@@ -1430,6 +1537,15 @@ class MentraLive: NSObject, SGCManager {
     private var connectionTimeoutTimer: Timer?
     private var reconnectionWorkItem: DispatchWorkItem?
 
+    // Watchdog for the retained background-reconnect pending connect. A bare
+    // pending `connect` does not always complete when the peripheral reappears
+    // (e.g. after a glasses power-cycle that rotates the BLE identity), leaving
+    // us stuck in CONNECTING. While alive and not yet BLE-connected, this kicks a
+    // scan to actively rediscover + connect (foreground); in the background it is
+    // frozen and the armed pending connect stays the fallback.
+    private var pendingConnectWatchdog: Timer?
+    private let PENDING_CONNECT_WATCHDOG_SEC: TimeInterval = 30.0
+
     // MARK: - Initialization
 
     override init() {
@@ -1465,6 +1581,16 @@ class MentraLive: NSObject, SGCManager {
 
     private var discoveredPeripherals = [String: CBPeripheral]() // name -> peripheral
 
+    /// Central-manager options, adding the restore identifier when the SDK was
+    /// configured for CoreBluetooth state restoration (opt-in, off by default).
+    private func centralManagerOptions() -> [String: Any] {
+        var options: [String: Any] = ["CBCentralManagerOptionShowPowerAlertKey": 0]
+        if let restoreId = BluetoothBackgroundConfig.restoreIdentifier {
+            options[CBCentralManagerOptionRestoreIdentifierKey] = restoreId
+        }
+        return options
+    }
+
     func findCompatibleDevices() {
         Bridge.log("Finding compatible Mentra Live glasses")
 
@@ -1472,7 +1598,7 @@ class MentraLive: NSObject, SGCManager {
             if centralManager == nil {
                 centralManager = CBCentralManager(
                     delegate: self, queue: bluetoothQueue,
-                    options: ["CBCentralManagerOptionShowPowerAlertKey": 0]
+                    options: centralManagerOptions()
                 )
                 // wait for the central manager to be fully initialized before we start scanning:
                 try? await Task.sleep(nanoseconds: 100 * 1_000_000) // 100ms
@@ -1494,8 +1620,32 @@ class MentraLive: NSObject, SGCManager {
         if centralManager == nil {
             centralManager = CBCentralManager(
                 delegate: self, queue: bluetoothQueue,
-                options: ["CBCentralManagerOptionShowPowerAlertKey": 0]
+                options: centralManagerOptions()
             )
+        }
+
+        // Known device + background reconnect: reconnect via a RETAINED pending
+        // connect (retrieve by saved UUID, no scan) — the only connect that
+        // completes while backgrounded/locked, since a background scan is not
+        // delivered. If BLE isn't powered on yet (manager just created), defer to
+        // centralManagerDidUpdateState(.poweredOn), which retrieves + pending-
+        // connects once ready. Either branch returns — we never fall through to a
+        // scan for a known device, so the scan can't hijack the pending connect.
+        if BluetoothBackgroundConfig.backgroundReconnect,
+           UserDefaults.standard.string(forKey: PREFS_DEVICE_UUID) != nil
+        {
+            if centralManager?.state == .poweredOn,
+               let uuidString = UserDefaults.standard.string(forKey: PREFS_DEVICE_UUID),
+               let uuid = UUID(uuidString: uuidString),
+               let peripheral = centralManager?.retrievePeripherals(withIdentifiers: [uuid]).first
+            {
+                Bridge.log("connectById: retrieved known peripheral \(uuid.uuidString) — pending connect (no scan)")
+                discoveredPeripherals[peripheral.name ?? deviceName] = peripheral
+                startPendingConnect(peripheral)
+            } else {
+                Bridge.log("connectById: BLE not ready — deferring pending connect to poweredOn")
+            }
+            return
         }
 
         // Check for already-connected peripherals first
@@ -1904,7 +2054,10 @@ class MentraLive: NSObject, SGCManager {
         connectedPeripheral = peripheral
         peripheral.delegate = self
 
-        // Set connection timeout
+        // Always arm the connection timeout. If the connect stalls (doesn't
+        // fire didConnect), the timeout cancels it and handleReconnection
+        // rescans+retries. Skipping it (the old backgroundReconnect path) left a
+        // stalled connect hanging forever with no recovery.
         startConnectionTimeout()
 
         centralManager?.connect(peripheral, options: nil)
@@ -4261,6 +4414,7 @@ class MentraLive: NSObject, SGCManager {
         stopSignalStrengthPolling()
         stopReadinessCheckLoop()
         stopConnectionTimeout()
+        stopPendingConnectWatchdog()
         stopMicBeat() // Stop LC3 audio micbeat
         pendingMessageTimer?.invalidate()
         pendingMessageTimer = nil
@@ -4387,6 +4541,9 @@ class MentraLive: NSObject, SGCManager {
         DeviceStore.shared.apply("glasses", "hotspotGatewayIp", "")
 
         connectedPeripheral = nil
+        // The retained pending connect belongs to the manager we're tearing down;
+        // drop it so a stale peripheral isn't re-issued against a new manager.
+        pendingReconnectPeripheral = nil
         centralManager?.delegate = nil
         centralManager = nil
 
