@@ -949,11 +949,17 @@ extension MentraLive: CBCentralManagerDelegate {
     }
 
     nonisolated func centralManager(
-        _: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error _: Error?
+        _: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?
     ) {
+        let disconnectReason: String
+        if let error = error as NSError? {
+            disconnectReason = "\(error.localizedDescription) [\(error.domain) code \(error.code)]"
+        } else {
+            disconnectReason = "clean disconnect (no error — local cancel or peer closed link)"
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            Bridge.log("LIVE: Disconnected from GATT server")
+            Bridge.log("LIVE: Disconnected from GATT server: \(disconnectReason)")
 
             self.isConnecting = false
 
