@@ -199,6 +199,22 @@ public class K900NetworkManager extends BaseNetworkManager {
                 Log.d(TAG, "🔥 ✅ WiFi radio already enabled");
             }
 
+            // Re-assert the 5 GHz AP band before ap_start. The band is a firmware
+            // flag (hotspot_wifi5g), not part of the ap_start intent, and is set
+            // only once ~3s after boot; if that didn't stick the AP falls back to
+            // 2.4 GHz, where it shares the radio with the still-connected 2.4 GHz
+            // BLE link and throughput collapses (~2 vs ~12 MB/s). The sleep gives
+            // the firmware a beat to apply the flag before ap_start reads it. No-op
+            // off K900.
+            Log.d(TAG, "🔥 📶 Requesting 5 GHz hotspot band before ap_start");
+            SystemControllerFactory.get(context).setHotspot5GEnabled(true);
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Log.w(TAG, "🔥 ⚠️ Interrupted while applying 5 GHz hotspot band", e);
+                Thread.currentThread().interrupt();
+            }
+
             // Send K900 hotspot enable intent
             Log.d(TAG, "🔥 📡 Sending K900 hotspot enable intent...");
             Intent intent = new Intent();
