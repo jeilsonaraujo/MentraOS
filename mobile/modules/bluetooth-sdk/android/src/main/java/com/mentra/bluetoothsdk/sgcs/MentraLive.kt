@@ -5267,8 +5267,21 @@ class MentraLive : SGCManager() {
             val bleImgId = "I" + String.format("%09d", System.currentTimeMillis() % 1000000000)
             json.put("bleImgId", bleImgId)
 
-            // Use auto mode by default - glasses will decide based on connectivity
-            json.put("transferMethod", "auto")
+            // Transfer method is derived from the request's intent, not hardcoded.
+            // The three cases the firmware routes on (asg_client PhotoCommandHandler):
+            //   1. save + no webhook  -> "local" : capture + on-glasses gallery save,
+            //      NO transfer to the phone. Uses takePhotoAndUpload with an empty
+            //      webhook ("no upload phase to run"), so it is Wi-Fi-independent.
+            //   2. want the bytes now -> "ble"   : takePhotoForBleTransfer, streamed
+            //      to the phone over Bluetooth (only when the caller explicitly asks).
+            //   3. upload to a webhook -> "auto" : takePhotoAutoTransfer, uploads over
+            //      the glasses' own Wi-Fi with a BLE fallback when Wi-Fi is down.
+            // A pure gallery save must NOT use "auto": off Wi-Fi, "auto" falls back to
+            // a BLE transfer and streams the JPEG to the phone mid-session (the DIM-376
+            // regression). It has no webhook, so it is case 1 -> "local".
+            val hasWebhook = webhookUrl != null && !webhookUrl.isEmpty()
+            val transferMethod = if (save && !hasWebhook) "local" else "auto"
+            json.put("transferMethod", transferMethod)
 
             // Always prepare for potential BLE transfer
             if (webhookUrl != null && !webhookUrl.isEmpty()) {
@@ -5278,7 +5291,7 @@ class MentraLive : SGCManager() {
                 blePhotoTransfers[bleImgId] = transfer
             }
 
-            Bridge.log("LIVE: Using auto transfer mode with BLE fallback ID: " + bleImgId)
+            Bridge.log("LIVE: Using " + transferMethod + " transfer mode (BLE fallback ID: " + bleImgId + ")")
             Bridge.log(
                     "LIVE: PHOTO PIPELINE [5b/6] JSON ready — " +
                             summarizeOutgoingMessage(json.toString()) +

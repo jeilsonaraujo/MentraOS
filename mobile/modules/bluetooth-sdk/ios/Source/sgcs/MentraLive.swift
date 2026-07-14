@@ -975,8 +975,10 @@ extension MentraLive: CBCentralManagerDelegate {
             self.txCharacteristic = nil
             self.rxCharacteristic = nil
 
-            // Attempt reconnection if not killed
-            if !self.isKilled {
+            // Attempt reconnection unless the SDK was killed or the glasses
+            // announced an intentional shutdown — in which case we stay idle until
+            // the user explicitly reconnects (see [intentionalShutdown]).
+            if !self.isKilled && !self.intentionalShutdown {
                 if BluetoothBackgroundConfig.backgroundReconnect {
                     // Known peripheral: leave a retained pending connect so the OS
                     // reconnects it whenever it reappears — including while the app
@@ -985,6 +987,8 @@ extension MentraLive: CBCentralManagerDelegate {
                 } else {
                     self.handleReconnection()
                 }
+            } else if self.intentionalShutdown {
+                Bridge.log("LIVE: Skipping reconnect — glasses shut down intentionally")
             }
         }
     }
@@ -1463,6 +1467,11 @@ class MentraLive: NSObject, SGCManager {
     private let SIGNAL_STRENGTH_READ_INTERVAL_MS: TimeInterval = 10.0
     private let MIN_SEND_DELAY_MS: UInt64 = 160_000_000 // 160ms in nanoseconds
     private let READINESS_CHECK_INTERVAL_MS: TimeInterval = 2.5 // 2.5 seconds
+    // Cap the SOC readiness handshake: at 2.5s each, ~12 checks ≈ 30s. If the SOC
+    // hasn't answered by then the glasses are effectively off (e.g. a shutdown left
+    // the BES radio advertising while the MTK SOC powered down), so we stop
+    // hammering phone_ready and drop the link instead of looping forever.
+    private let MAX_READINESS_CHECKS = 12
 
     /// Device Settings Keys
     private let PREFS_DEVICE_NAME = "MentraLiveLastConnectedDeviceName"
@@ -1494,6 +1503,14 @@ class MentraLive: NSObject, SGCManager {
     private var isScanning = false
     private var isConnecting = false
     private var isKilled = false
+    // Set when the glasses announce a graceful shutdown (sr_shut). Suppresses the
+    // auto-reconnect for that disconnect so we don't reconnect to a device that is
+    // powering off: the BES BLE radio keeps advertising while the MTK SOC dies, so
+    // re-arming the pending connect would reconnect BLE and spin the phone_ready
+    // readiness loop against a dead SOC forever. Non-sticky — cleared on the next
+    // explicit connect (connectById / findCompatibleDevices) so a power-cycle +
+    // reconnect works normally.
+    private var intentionalShutdown = false
     private var reconnectAttempts = 0
     private var isNewVersion = false
     private var globalMessageId = 0
@@ -1599,6 +1616,8 @@ class MentraLive: NSObject, SGCManager {
 
     func findCompatibleDevices() {
         Bridge.log("Finding compatible Mentra Live glasses")
+        // Explicit user action clears any intentional-shutdown suppression.
+        intentionalShutdown = false
 
         Task {
             if centralManager == nil {
@@ -1619,6 +1638,9 @@ class MentraLive: NSObject, SGCManager {
 
     func connectById(_ deviceName: String) {
         Bridge.log("connectById: \(deviceName)")
+        // Explicit (re)connect clears any intentional-shutdown suppression so a
+        // power-cycled device connects normally.
+        intentionalShutdown = false
         // Save the device name for future reconnection
         UserDefaults.standard.set(deviceName, forKey: PREFS_DEVICE_NAME)
 
@@ -1785,7 +1807,22 @@ class MentraLive: NSObject, SGCManager {
         let bleImgId =
             "I" + String(format: "%09d", Int(Date().timeIntervalSince1970 * 1000) % 100_000_000)
         json["bleImgId"] = bleImgId
-        json["transferMethod"] = "auto"
+
+        // Transfer method is derived from the request's intent, not hardcoded.
+        // The three cases the firmware routes on (asg_client PhotoCommandHandler):
+        //   1. save + no webhook  -> "local" : capture + on-glasses gallery save,
+        //      NO transfer to the phone. Uses takePhotoAndUpload with an empty
+        //      webhook ("no upload phase to run"), so it is Wi-Fi-independent.
+        //   2. want the bytes now -> "ble"   : takePhotoForBleTransfer, streamed
+        //      to the phone over Bluetooth (only when the caller explicitly asks).
+        //   3. upload to a webhook -> "auto" : takePhotoAutoTransfer, uploads over
+        //      the glasses' own Wi-Fi with a BLE fallback when Wi-Fi is down.
+        // A pure gallery save must NOT use "auto": off Wi-Fi, "auto" falls back to
+        // a BLE transfer and streams the JPEG to the phone mid-session (the DIM-376
+        // regression). It has no webhook, so it is case 1 -> "local".
+        let hasWebhook = !(request.webhookUrl?.isEmpty ?? true)
+        let transferMethod = (request.save && !hasWebhook) ? "local" : "auto"
+        json["transferMethod"] = transferMethod
 
         if let webhookUrl = request.webhookUrl, !webhookUrl.isEmpty {
             json["webhookUrl"] = webhookUrl
@@ -1825,7 +1862,7 @@ class MentraLive: NSObject, SGCManager {
         }
         request.appendScanFields(to: &json)
 
-        Bridge.log("LIVE: PHOTO PIPELINE [5b/6] take_photo JSON ready bleImgId=\(bleImgId) transferMethod=auto")
+        Bridge.log("LIVE: PHOTO PIPELINE [5b/6] take_photo JSON ready bleImgId=\(bleImgId) transferMethod=\(transferMethod)")
         Bridge.log("LIVE: PHOTO PIPELINE [6/6] Dispatching take_photo to sendJson()")
 
         sendJson(json, wakeUp: true)
@@ -2072,6 +2109,10 @@ class MentraLive: NSObject, SGCManager {
     private func handleReconnection() {
         if isKilled {
             Bridge.log("LIVE: Reconnection aborted - device has been killed")
+            return
+        }
+        if intentionalShutdown {
+            Bridge.log("LIVE: Reconnection aborted - glasses shut down intentionally")
             return
         }
 
@@ -2765,15 +2806,17 @@ class MentraLive: NSObject, SGCManager {
 
         case "sr_shut":
             Bridge.log("K900 shutdown command received - glasses shutting down")
-            // Mark as killed to prevent reconnection attempts
-            // isKilled = true
-            // // Clean disconnect without reconnection
-            // if let peripheral = connectedPeripheral {
-            //     Bridge.log("Disconnecting from glasses due to shutdown")
-            //     centralManager?.cancelPeripheralConnection(peripheral)
-            // }
-            // Notify the system that glasses are intentionally disconnected
+            // Intentional shutdown: suppress the auto-reconnect for the disconnect
+            // that's about to happen, stop the readiness handshake, and drop the
+            // link now. Without this we reconnect to the BES radio (still
+            // advertising as the SOC powers down) and spin phone_ready forever.
+            intentionalShutdown = true
+            stopReadinessCheckLoop()
             updateConnectionState(ConnTypes.DISCONNECTED)
+            if let peripheral = connectedPeripheral {
+                Bridge.log("LIVE: Cancelling connection due to intentional shutdown")
+                centralManager?.cancelPeripheralConnection(peripheral)
+            }
 
         case "sr_adota":
             // BES chip OTA progress — K900 path. Emit ota_status only (legacy ota_progress removed).
@@ -4353,6 +4396,22 @@ class MentraLive: NSObject, SGCManager {
             guard let self else { return }
 
             self.readinessCheckCounter += 1
+
+            // Backstop: if the SOC never answers (e.g. the glasses are powering off
+            // but the BES radio still advertises), stop hammering phone_ready and
+            // drop the link instead of looping forever.
+            if self.readinessCheckCounter > self.MAX_READINESS_CHECKS {
+                Bridge.log(
+                    "LIVE: 🔄 SOC not ready after \(self.MAX_READINESS_CHECKS) checks — giving up, dropping link"
+                )
+                self.stopReadinessCheckLoop()
+                self.updateConnectionState(ConnTypes.DISCONNECTED)
+                if let peripheral = self.connectedPeripheral {
+                    self.centralManager?.cancelPeripheralConnection(peripheral)
+                }
+                return
+            }
+
             Bridge.log(
                 "LIVE: 🔄 Readiness check #\(self.readinessCheckCounter): waiting for glasses SOC to boot"
             )
