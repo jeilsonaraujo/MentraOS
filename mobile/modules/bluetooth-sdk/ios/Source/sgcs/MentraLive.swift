@@ -1464,6 +1464,10 @@ class MentraLive: NSObject, SGCManager {
     private let CONNECTION_TIMEOUT_MS: UInt64 = 100_000_000_000 // 100 seconds
     private let HEARTBEAT_INTERVAL_MS: TimeInterval = 30.0 // 30 seconds
     private let BATTERY_REQUEST_EVERY_N_HEARTBEATS = 10
+    // Real ACK latency under A2DP contention runs 1.5–2s; a 1s window spuriously
+    // timed out every tracked command. 3s clears the contention window.
+    private let ACK_TIMEOUT_SEC: TimeInterval = 3.0
+    private let MAX_ACK_RETRIES = 3
     private let SIGNAL_STRENGTH_READ_INTERVAL_MS: TimeInterval = 10.0
     private let MIN_SEND_DELAY_MS: UInt64 = 160_000_000 // 160ms in nanoseconds
     private let READINESS_CHECK_INTERVAL_MS: TimeInterval = 2.5 // 2.5 seconds
@@ -1983,13 +1987,14 @@ class MentraLive: NSObject, SGCManager {
             // Set the pending message
             pending = message
 
-            // Start retry timer for 1s
+            // Start retry timer
             DispatchQueue.main.async { [weak self] in
-                self?.pendingMessageTimer?.invalidate()
-                self?.pendingMessageTimer = Timer.scheduledTimer(
-                    withTimeInterval: 1, repeats: false
+                guard let self else { return }
+                self.pendingMessageTimer?.invalidate()
+                self.pendingMessageTimer = Timer.scheduledTimer(
+                    withTimeInterval: self.ACK_TIMEOUT_SEC, repeats: false
                 ) { _ in
-                    self?.handlePendingMessageTimeout()
+                    self.handlePendingMessageTimeout()
                 }
             }
         }
@@ -1999,15 +2004,16 @@ class MentraLive: NSObject, SGCManager {
     private func handlePendingMessageTimeout() {
         guard let pendingMessage = pending else { return }
 
-        Bridge.log(
-            "⚠️ Message timeout - no response for mId: \(pendingMessage.id), retry attempt: \(pendingMessage.retries + 1)/3"
-        )
-
         // Clear the pending message
         pending = nil
 
-        // Check if we should retry
-        if pendingMessage.retries < 3 {
+        // Check if we should retry (retries counts retransmissions, not the initial send)
+        if pendingMessage.retries < MAX_ACK_RETRIES {
+            let attempt = pendingMessage.retries + 1
+            Bridge.log(
+                "⚠️ Message timeout - no response for mId: \(pendingMessage.id), retrying (attempt \(attempt)/\(MAX_ACK_RETRIES))"
+            )
+
             // Create a new message with incremented retry count
             let retryMessage = PendingMessage(
                 data: pendingMessage.data,
@@ -2019,12 +2025,8 @@ class MentraLive: NSObject, SGCManager {
             Task {
                 await self.commandQueue.pushToFront(retryMessage)
             }
-
-            Bridge.log(
-                "🔄 Retrying message mId: \(pendingMessage.id) (attempt \(retryMessage.retries)/3)"
-            )
         } else {
-            Bridge.log("❌ Message failed after 3 retries - mId: \(pendingMessage.id)")
+            Bridge.log("❌ Message failed after \(MAX_ACK_RETRIES) retries - mId: \(pendingMessage.id)")
             // Optionally emit an event or callback for failed message
         }
     }
@@ -2443,7 +2445,10 @@ class MentraLive: NSObject, SGCManager {
             let timestamp = parseTimestamp(json["timestamp"])
             handleSwitchStatus(switchType: switchType, value: switchValue, timestamp: timestamp)
 
-        case "rgb_led_control_response":
+        // Firmware replies with "<commandType>_response" (e.g. rgb_led_control_on_response)
+        // or "rgb_led_control_error", not the generic "rgb_led_control_response".
+        case let ledType where ledType.hasPrefix("rgb_led_control")
+            && (ledType.hasSuffix("_response") || ledType.hasSuffix("_error")):
             let requestId = json["requestId"] as? String ?? ""
             let state = json["state"] as? String
             let success = state == "success" || json["success"] as? Bool == true
@@ -5108,13 +5113,11 @@ extension MentraLive {
             sendRgbLedControlAuthority(true)
         }
 
+        // packageName intentionally omitted: the firmware RgbLedCommandHandler ignores it,
+        // and dropping it keeps the C-wrapped command under the chunking threshold.
         var command: [String: Any] = [
             "requestId": requestId,
         ]
-
-        if let packageName, !packageName.isEmpty {
-            command["packageName"] = packageName
-        }
 
         switch action {
         case "on":
@@ -5135,7 +5138,9 @@ extension MentraLive {
         }
 
         Bridge.log("LIVE: Forwarding RGB LED command to glasses: \(command)")
-        sendJson(command, wakeUp: true)
+        // Cosmetic LED: fire-and-forget (requireAck:false) so it never occupies the
+        // single pending/ACK gate and never retries. Losing a blink is invisible.
+        sendJson(command, wakeUp: true, requireAck: false)
     }
 
     private func ledIndex(for color: String?) -> Int {

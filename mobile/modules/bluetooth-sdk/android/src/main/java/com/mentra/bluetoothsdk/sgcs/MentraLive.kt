@@ -165,7 +165,8 @@ class MentraLive : SGCManager() {
         private const val GLASSES_MEDIA_VOLUME_TIMEOUT_MS = 2000
 
         // Message tracking for reliable delivery
-        private const val ACK_TIMEOUT_MS = 2000L // 2 seconds
+        // Real ACK latency under A2DP contention runs 1.5–2s; 3s clears the contention window.
+        private const val ACK_TIMEOUT_MS = 3000L // 3 seconds
         private const val MAX_RETRY_ATTEMPTS = 3
         private const val RETRY_DELAY_MS = 1000L // 1 second base delay
 
@@ -3644,8 +3645,12 @@ class MentraLive : SGCManager() {
                 handler.post { Bridge.sendMtkUpdateComplete(updateMessage) }
             }
             else -> {
-                // Flexible version_info parsing - handle any version_info* message
-                if (type.startsWith("version_info")) {
+                // Firmware replies with "<commandType>_response" (e.g. rgb_led_control_on_response)
+                // or "rgb_led_control_error", not the generic "rgb_led_control_response".
+                if (type.startsWith("rgb_led_control") &&
+                        (type.endsWith("_response") || type.endsWith("_error"))) {
+                    handleRgbLedControlResponse(json)
+                } else if (type.startsWith("version_info")) {
                     Bridge.log("LIVE: Received " + type + ": " + json.toString())
 
                     // Extract all fields from JSON (except "type")
@@ -7221,9 +7226,10 @@ class MentraLive : SGCManager() {
             when (type) {
                 "request_wifi_scan" -> requestWifiScan()
                 "rgb_led_control_on", "rgb_led_control_off" -> {
-                    // Forward LED control commands directly to glasses via BLE
+                    // Forward LED control commands directly to glasses via BLE.
+                    // Cosmetic LED: fire-and-forget (no ACK tracking) so it never retries.
                     Log.d(TAG, "💡 Forwarding LED control command to glasses: " + type)
-                    sendJson(json, true)
+                    sendJsonWithoutAck(json, true)
                 }
                 else -> {
                     Log.w(
@@ -7306,12 +7312,10 @@ class MentraLive : SGCManager() {
         }
 
         try {
+            // packageName intentionally omitted: the firmware RgbLedCommandHandler ignores it,
+            // and dropping it keeps the C-wrapped command under the chunking threshold.
             val command = JSONObject()
             command.put("requestId", requestId)
-
-            if (packageName != null && !packageName.isEmpty()) {
-                command.put("packageName", packageName)
-            }
 
             when (action) {
                 "on" -> {
@@ -7331,7 +7335,9 @@ class MentraLive : SGCManager() {
             }
 
             Bridge.log("LIVE: 💡 Forwarding RGB LED command to glasses: " + command.toString())
-            sendJson(command, true)
+            // Cosmetic LED: fire-and-forget (no ACK tracking) so it never occupies the
+            // ACK gate and never retries. Losing a blink is invisible.
+            sendJsonWithoutAck(command, true)
         } catch (e: JSONException) {
             Log.e(TAG, "Error building RGB LED command", e)
             Bridge.sendRgbLedControlResponse(requestId, false, "json_error")
@@ -7350,6 +7356,20 @@ class MentraLive : SGCManager() {
             "white" -> return 4
             else -> return 0
         }
+    }
+
+    /** Forward an RGB LED control response/error from the glasses to the app. Matches iOS. */
+    private fun handleRgbLedControlResponse(json: JSONObject) {
+        val requestId = json.optString("requestId", "")
+        val state = json.optString("state", "")
+        val success = state == "success" || json.optBoolean("success", false)
+        val error =
+                when {
+                    json.has("errorCode") -> json.optString("errorCode", null)
+                    json.has("error") -> json.optString("error", null)
+                    else -> null
+                }
+        Bridge.sendRgbLedControlResponse(requestId, success, error)
     }
 
     /**

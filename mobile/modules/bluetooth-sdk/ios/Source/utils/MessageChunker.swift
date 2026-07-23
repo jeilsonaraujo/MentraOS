@@ -20,7 +20,10 @@ class MessageChunker {
     // BES2700 limit is 253 bytes; anything over ~200 bytes packed needs chunking.
     private static let MESSAGE_SIZE_THRESHOLD = 200
 
-    private static let INITIAL_CHUNK_DATA_SIZE = 80
+    // Upper bound for the search below. The search strides down until every packed
+    // chunk fits MAX_PACKED_CHUNK_SIZE, so starting near the 253-byte cap lets typical
+    // commands use the largest fitting slice (fewer chunks) instead of an 80-byte cap.
+    private static let INITIAL_CHUNK_DATA_SIZE = 200
     private static let MIN_CHUNK_DATA_SIZE = 4
     private static let MAX_PACKED_CHUNK_SIZE = 253
     private static let K900_FRAME_OVERHEAD = 7
