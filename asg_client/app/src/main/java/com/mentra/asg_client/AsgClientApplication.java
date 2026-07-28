@@ -4,6 +4,7 @@ import android.app.Application;
 import android.util.Log;
 import com.mentra.asg_client.di.ReportingModule;
 import com.mentra.asg_client.reporting.CrashHandler;
+import com.mentra.asg_client.reporting.PersistentLogCapture;
 import com.mentra.asg_client.reporting.core.ReportManager;
 import com.mentra.asg_client.service.system.core.SystemControllerFactory;
 import dagger.hilt.android.HiltAndroidApp;
@@ -19,6 +20,10 @@ public class AsgClientApplication extends Application {
     public void onCreate() {
         super.onCreate();
         instance = this;
+
+        // First, so the on-disk log covers the rest of startup. Runs on any process start
+        // (boot, crash restart, package replace), which is what keeps capture continuous.
+        PersistentLogCapture.start(this);
 
         CrashHandler.install();
         ReportingModule.initialize(this);

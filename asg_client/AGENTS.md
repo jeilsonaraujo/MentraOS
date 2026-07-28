@@ -188,6 +188,7 @@ asg_client/
 - **docs/ASG_CLIENT_API.md** - ASG command surface, including audio and RGB LED commands
 - **docs/agents/PHOTO_TESTING_GUIDE.md** - Photo capture testing guide
 - **docs/features/led-control.md** - K900 local LED and RGB LED control details
+- **docs/features/persistent-logs.md** - Continuous on-device logcat capture (no ADB tether needed)
 - **app/src/main/java/com/mentra/asg_client/reporting/SENTRY_CONFIGURATION.md** - Sentry error reporting setup
 - **app/src/main/java/com/mentra/asg_client/reporting/README.md** - Comprehensive reporting system guide
 

@@ -35,6 +35,13 @@
         tools:ignore="ScopedStorage" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- Lets PersistentLogCapture record system-wide logcat (kernel, ActivityManager, BT stack)
+         instead of only this app's UID. Development-level: must be granted once over ADB with
+         "adb shell pm grant <package> android.permission.READ_LOGS". -->
+    <uses-permission
+        android:name="android.permission.READ_LOGS"
+        tools:ignore="ProtectedPermissions" />
+
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />

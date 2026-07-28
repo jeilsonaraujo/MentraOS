@@ -137,6 +137,9 @@ PERMISSIONS=(
     "android.permission.READ_MEDIA_VIDEO"
     "android.permission.POST_NOTIFICATIONS"
     "android.permission.READ_PHONE_STATE"
+    # System-wide logcat capture (PersistentLogCapture). Without it the on-disk
+    # log only contains this app's own lines.
+    "android.permission.READ_LOGS"
 )
 
 for perm in "${PERMISSIONS[@]}"; do
