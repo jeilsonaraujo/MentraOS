@@ -108,6 +108,7 @@ public final class ServiceConstants {
     // ---------------------------------------------
     public static final String BUTTON_PRESS_SHORT = "short";
     public static final String BUTTON_PRESS_LONG = "long";
+    public static final String BUTTON_PRESS_DOUBLE = "double";
 
     // ---------------------------------------------
     // Timeouts and Delays

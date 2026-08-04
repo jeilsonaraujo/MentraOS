@@ -12,6 +12,7 @@ import com.mentra.asg_client.io.peripheral.events.McuEvent;
 import com.mentra.asg_client.service.core.constants.BatteryConstants;
 import com.mentra.asg_client.service.legacy.managers.AsgClientServiceManager;
 import com.mentra.asg_client.service.system.interfaces.IStateManager;
+import com.mentra.asg_client.service.utils.ServiceConstants;
 import com.mentra.asg_client.settings.VideoSettings;
 import com.mentra.asg_client.utils.WakeLockManager;
 import org.json.JSONException;
@@ -55,6 +56,12 @@ public final class ButtonEventSubscriber implements IPeripheralBus.McuEventListe
                 Log.d(TAG, "📹 Camera button long pressed - handling with configurable mode");
                 handleConfigurableButtonPress(true); // true = long press
                 break;
+            case CAMERA_DOUBLE_PRESS:
+                // Forward only: a double press has no local capture behaviour of its own, and the
+                // MCU does not send the individual short presses, so nothing was captured already.
+                Log.d(TAG, "📸📸 Camera button double pressed - forwarding to phone/apps");
+                sendButtonPressToPhone(ServiceConstants.BUTTON_PRESS_DOUBLE);
+                break;
             case POWER_SHORT_PRESS:
                 handlePowerButtonShortPress();
                 break;
@@ -70,12 +77,15 @@ public final class ButtonEventSubscriber implements IPeripheralBus.McuEventListe
      */
     private void handleConfigurableButtonPress(boolean isLongPress) {
         if (serviceManager != null && serviceManager.getAsgSettings() != null) {
-            String pressType = isLongPress ? "long" : "short";
+            String pressType =
+                    isLongPress
+                            ? ServiceConstants.BUTTON_PRESS_LONG
+                            : ServiceConstants.BUTTON_PRESS_SHORT;
             Log.d(TAG, "Handling " + pressType + " button press");
 
             // ALWAYS send button press to phone/apps
             Log.d(TAG, "📱 Forwarding button press to phone/apps (universal forwarding)");
-            sendButtonPressToPhone(isLongPress);
+            sendButtonPressToPhone(pressType);
 
             // Check if camera/gallery app is active for local capture
             handlePhotoCapture(isLongPress);
@@ -190,7 +200,7 @@ public final class ButtonEventSubscriber implements IPeripheralBus.McuEventListe
     }
 
     /** Send button press to phone via Bluetooth */
-    private void sendButtonPressToPhone(boolean isLongPress) {
+    private void sendButtonPressToPhone(String pressType) {
         if (serviceManager != null
                 && serviceManager.getBluetoothManager() != null
                 && serviceManager.getBluetoothManager().isConnected()) {
@@ -198,7 +208,7 @@ public final class ButtonEventSubscriber implements IPeripheralBus.McuEventListe
                 JSONObject buttonObject = new JSONObject();
                 buttonObject.put("type", "button_press");
                 buttonObject.put("buttonId", "camera");
-                buttonObject.put("pressType", isLongPress ? "long" : "short");
+                buttonObject.put("pressType", pressType);
                 buttonObject.put("timestamp", System.currentTimeMillis());
 
                 String jsonString = buttonObject.toString();

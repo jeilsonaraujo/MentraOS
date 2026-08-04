@@ -138,6 +138,29 @@ public class McuEventParserTest {
     }
 
     @Test
+    public void srKeyevt_cameraDoublePress_mapsToButtonEvent() throws Exception {
+        McuEvent event =
+                McuEventParser.parse(
+                        cmd("sr_keyevt", new JSONObject().put("button", 1).put("type", 2)));
+        assertThat(event).isInstanceOf(ButtonEvent.class);
+        assertThat(((ButtonEvent) event).getType()).isEqualTo(ButtonEvent.Type.CAMERA_DOUBLE_PRESS);
+    }
+
+    @Test
+    public void srKeyevt_doublePressTypeOnOtherButton_returnsNull() throws Exception {
+        // The double press mapping must match on the button id too, not on the gesture type alone.
+        assertThat(
+                        McuEventParser.parse(
+                                cmd("sr_keyevt", new JSONObject().put("button", 0).put("type", 2))))
+                .isNull();
+    }
+
+    @Test
+    public void srKeyevt_missingBody_returnsNull() throws Exception {
+        assertThat(McuEventParser.parse(cmd("sr_keyevt"))).isNull();
+    }
+
+    @Test
     public void srKeyevt_otherCombo_returnsNull() throws Exception {
         assertThat(
                         McuEventParser.parse(

@@ -992,7 +992,7 @@ The K900 microcontroller frames messages as `{"C": "<cmd>", "B": {...}, "V": 1}`
 | `sr_vad`              | Voice Activity Detection event                       | (logged only)                             |
 | `hs_syvr`             | System version report                                | (cached, triggers `request_version` push) |
 | `sr_btaddr`           | BT MAC address                                       | (persisted to system properties)          |
-| `sr_keyevt`           | Power button short press                             | (announces battery via audio asset)       |
+| `sr_keyevt`           | Power button short press, camera button double press  | (announces battery via audio asset / forwards `pressType: "double"`) |
 | `sr_log`              | BES log stream packet                                | (forwarded to upload pipeline)            |
 | `cs_shut`             | BES requesting graceful shutdown                     | `sr_shut` ack, then shutdown              |
 

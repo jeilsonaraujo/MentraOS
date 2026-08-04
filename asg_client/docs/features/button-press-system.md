@@ -12,6 +12,10 @@ Source: `service/core/handlers/K900CommandHandler.java` (`handleConfigurableButt
    - `cs_pho` — short press
    - `cs_vdo` — long press
    - `hs_ntfy` with `msg: "button click"` / `"button long click"` — newer firmware format
+   - `sr_keyevt` with `button=1, type=2` — **double press**. The MCU resolves this gesture itself
+     and sends only this event; it does _not_ also send the two `cs_pho` presses that make it up.
+     There is therefore no debounce window on the Android side, and a single press keeps its
+     original latency.
 4. **`K900CommandHandler` dispatches** to `handleCameraButtonShortPress()` or `handleCameraButtonLongPress()`, which both call `handleConfigurableButtonPress(isLongPress)`.
 5. **Universal forwarding** — _every_ press is forwarded to the phone as a `button_press` event, regardless of any local-capture decision.
 6. **Local capture decision** — runs through the gallery-mode gate (below), then takes the appropriate action.

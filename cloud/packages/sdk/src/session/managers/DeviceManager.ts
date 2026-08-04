@@ -59,8 +59,8 @@ import type { PermissionsManager } from "./PermissionsManager";
 export interface ButtonPressEvent {
   /** Identifier of the button that was pressed. */
   buttonId: string;
-  /** Whether the press was short or long. */
-  pressType: "short" | "long";
+  /** Whether the press was short, long, or a double press. */
+  pressType: "short" | "long" | "double";
 }
 
 /**

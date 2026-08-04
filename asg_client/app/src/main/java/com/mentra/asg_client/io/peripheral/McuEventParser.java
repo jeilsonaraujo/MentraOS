@@ -84,6 +84,11 @@ public final class McuEventParser {
                     if (button == 0 && type == 0) {
                         return new ButtonEvent(ButtonEvent.Type.POWER_SHORT_PRESS);
                     }
+                    if (button == 1 && type == 2) {
+                        // Camera button double press. The MCU debounces it itself; it does NOT also
+                        // send the individual cs_pho presses, so there is nothing to coalesce here.
+                        return new ButtonEvent(ButtonEvent.Type.CAMERA_DOUBLE_PRESS);
+                    }
                     return null; // Other key combos are not handled.
                 }
 

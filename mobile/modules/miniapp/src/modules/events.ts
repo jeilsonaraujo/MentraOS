@@ -61,7 +61,7 @@ export interface TranslationData {
 
 export interface ButtonPressData {
   buttonId: string
-  pressType: "short" | "long"
+  pressType: "short" | "long" | "double"
 }
 
 export interface HeadPositionData {

@@ -10,7 +10,7 @@ export type GlassesNotReadyEvent = {
 // filter on `pressType` / the "button_press" listener name, never `event.type`.
 export type ButtonPressEvent = {
   buttonId: string
-  pressType: "long" | "short"
+  pressType: "long" | "short" | "double"
   timestamp: number
 }
 

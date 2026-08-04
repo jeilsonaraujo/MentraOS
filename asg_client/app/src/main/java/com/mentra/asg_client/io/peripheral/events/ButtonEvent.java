@@ -9,6 +9,12 @@ public final class ButtonEvent extends McuEvent {
         CAMERA_SHORT_PRESS,
         /** Camera button long press ({@code cs_vdo}, {@code hs_ntfy} msg="button long click"). */
         CAMERA_LONG_PRESS,
+        /**
+         * Camera button double press ({@code sr_keyevt} button=1 type=2). The MCU resolves this
+         * gesture itself and reports it as a single event — it does not also send the individual
+         * {@code cs_pho} presses that make it up.
+         */
+        CAMERA_DOUBLE_PRESS,
         /** Power button short press ({@code sr_keyevt} button=0 type=0). */
         POWER_SHORT_PRESS
     }
