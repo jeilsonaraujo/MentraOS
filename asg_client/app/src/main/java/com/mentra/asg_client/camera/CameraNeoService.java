@@ -121,6 +121,57 @@ public class CameraNeoService extends LifecycleService {
     // frames) before each still — capped by sweepAfMaxMs so a code the AF can't lock still shoots.
     private boolean sweepAfLock = true;
     private int sweepAfMaxMs = 1000;
+    // Result-out (DIM-560 BLE bridge): correlation id from the start command + the decoded hit.
+    private String sweepRequestId;
+    private String sweepHitValue;
+    private String sweepHitFormat;
+    private boolean sweepResultEmitted = false;
+
+    /**
+     * One-shot sink for a sweep's outcome. The BLE command handler sets this so the result is sent
+     * back over BLE (and mirrored to adb for the test harness). Cleared after a single emit.
+     */
+    public interface SweepResultCallback {
+        void onSweepResult(org.json.JSONObject result);
+    }
+
+    private static volatile SweepResultCallback sSweepResultCallback;
+
+    public static void setSweepResultCallback(SweepResultCallback cb) {
+        sSweepResultCallback = cb;
+    }
+
+    /** Emit the sweep outcome exactly once (found value, or found=false when exhausted/stopped). */
+    private void emitSweepResult(boolean found) {
+        if (sweepResultEmitted) {
+            return;
+        }
+        sweepResultEmitted = true;
+        SweepResultCallback cb = sSweepResultCallback;
+        try {
+            org.json.JSONObject o = new org.json.JSONObject();
+            o.put("type", "barcode_scan_result");
+            o.put("found", found);
+            if (found) {
+                o.put("value", sweepHitValue);
+                o.put("format", sweepHitFormat);
+            }
+            o.put("ts", System.currentTimeMillis());
+            o.put("frames", sweepFrameCount);
+            o.put("hit_frame", sweepHitFrame);
+            if (sweepRequestId != null) {
+                o.put("requestId", sweepRequestId);
+            }
+            Log.i(BarcodeScanController.TAG, "SWEEP result " + o);
+            if (cb != null) {
+                cb.onSweepResult(o);
+            }
+        } catch (Exception e) {
+            Log.w(BarcodeScanController.TAG, "sweep result emit failed", e);
+        } finally {
+            sSweepResultCallback = null; // one-shot
+        }
+    }
     private volatile boolean scanAwaitingAf = false;
     private long scanAfTriggeredAt = 0L;
 
@@ -268,6 +319,7 @@ public class CameraNeoService extends LifecycleService {
     public static final String EXTRA_SWEEP_AF_SETTLE = "sweep_af_settle";
     public static final String EXTRA_SWEEP_AF_LOCK = "sweep_af_lock";
     public static final String EXTRA_SWEEP_AF_MAX = "sweep_af_max";
+    public static final String EXTRA_SWEEP_REQUEST_ID = "sweep_request_id";
     // Scan preview resolution — bigger than the 320x240 photo-AE preview so small/1D codes at
     // arm's length stay legible, still cheap to decode.
     private static final int SCAN_PREVIEW_WIDTH = 640;
@@ -1218,6 +1270,10 @@ public class CameraNeoService extends LifecycleService {
         sweepAfSettleMs = Math.max(0, intent.getIntExtra(EXTRA_SWEEP_AF_SETTLE, 200));
         sweepAfLock = intent.getBooleanExtra(EXTRA_SWEEP_AF_LOCK, true);
         sweepAfMaxMs = Math.max(sweepAfSettleMs, intent.getIntExtra(EXTRA_SWEEP_AF_MAX, 1000));
+        sweepRequestId = intent.getStringExtra(EXTRA_SWEEP_REQUEST_ID);
+        sweepHitValue = null;
+        sweepHitFormat = null;
+        sweepResultEmitted = false;
         sweepFrameCount = 0;
         sweepHitFrame = -1;
         sweepLastFrameAt = 0L;
@@ -1284,6 +1340,11 @@ public class CameraNeoService extends LifecycleService {
 
         if (found && sweepHitFrame < 0) {
             sweepHitFrame = n;
+            // Remember the first decoded code ("FORMAT|value") for the BLE result.
+            String first = raw.get(0);
+            int bar = first.indexOf('|');
+            sweepHitFormat = bar >= 0 ? first.substring(0, bar) : "?";
+            sweepHitValue = bar >= 0 ? first.substring(bar + 1) : first;
             playFeedback(SCAN_SOUND_SUCCESS);  // first lock — tell the user it worked
         }
         Log.i(BarcodeScanController.TAG, "SWEEP n=" + n + " dt=" + sincePrev
@@ -1295,8 +1356,11 @@ public class CameraNeoService extends LifecycleService {
             playFeedback(SCAN_SOUND_FAIL);
         }
         writeSweepStatus(stop);
-        if (stop && backgroundHandler != null) {
-            backgroundHandler.post(this::stopScan);
+        if (stop) {
+            emitSweepResult(sweepHitFrame > 0);  // send the outcome over BLE (one-shot)
+            if (backgroundHandler != null) {
+                backgroundHandler.post(this::stopScan);
+            }
         }
     }
 
@@ -1778,6 +1842,7 @@ public class CameraNeoService extends LifecycleService {
         }
         if (sweepActive) {
             writeSweepStatus(true);  // mark the run done so the host stops polling
+            emitSweepResult(sweepHitFrame > 0);  // no-op if already emitted; covers external stop
             sweepActive = false;
         }
         if (wasScanning && scanController != null) {

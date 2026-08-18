@@ -11,6 +11,7 @@ import com.mentra.asg_client.service.communication.interfaces.ICommunicationMana
 import com.mentra.asg_client.service.communication.interfaces.IResponseBuilder;
 import com.mentra.asg_client.service.core.handlers.AuthTokenCommandHandler;
 import com.mentra.asg_client.service.core.handlers.BarcodeDecodeCommandHandler;
+import com.mentra.asg_client.service.core.handlers.BarcodeScanCommandHandler;
 import com.mentra.asg_client.service.core.handlers.BatteryCommandHandler;
 import com.mentra.asg_client.service.core.handlers.BleConfigCommandHandler;
 import com.mentra.asg_client.service.core.handlers.GalleryCommandHandler;
@@ -378,6 +379,10 @@ public class CommandProcessor {
 
             commandHandlerRegistry.registerHandler(new BarcodeDecodeCommandHandler());
             Log.d(TAG, "✅ Registered BarcodeDecodeCommandHandler");
+
+            commandHandlerRegistry.registerHandler(
+                    new BarcodeScanCommandHandler(context, communicationManager));
+            Log.d(TAG, "✅ Registered BarcodeScanCommandHandler");
 
             commandHandlerRegistry.registerHandler(
                     new StreamCommandHandler(context, stateManager, streamingManager));
