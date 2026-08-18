@@ -3,12 +3,22 @@ package com.mentra.asg_client.camera;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.ImageFormat;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
+import android.content.res.AssetFileDescriptor;
+import android.media.Image;
+import android.media.ImageReader;
+import android.media.MediaPlayer;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
@@ -22,6 +32,7 @@ import android.view.Surface;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.lifecycle.LifecycleService;
+import com.mentra.asg_client.camera.barcode.BarcodeScanController;
 import com.mentra.asg_client.camera.lifecycle.CameraCoordinator;
 import com.mentra.asg_client.camera.lifecycle.CameraOpener;
 import com.mentra.asg_client.camera.lifecycle.CameraRecoveryHelper;
@@ -75,6 +86,105 @@ public class CameraNeoService extends LifecycleService {
     private final CameraCoordinator cameraCoordinator = new CameraCoordinator();
     private Handler backgroundHandler;
     private String cameraId;
+    // DIM-560 barcode-scan session state (Phase 0 spike).
+    private volatile boolean scanning = false;
+    private ImageReader scanPreviewReader;
+    private ImageReader scanStillReader;
+    private BarcodeScanController scanController;
+    private long scanStartedAt = 0L;
+    // DIM-560 spike diagnostics: dump a few preview frames to disk so we can SEE what the
+    // camera captures (framing/focus/exposure) when a decode isn't happening. Capped.
+    private static final boolean SCAN_DUMP_FRAMES = true;
+    private static final int SCAN_DUMP_MAX = 8;
+    private static final int SCAN_DUMP_EVERY = 10;
+    private int scanFrameIndex = 0;
+    private int scanDumpsWritten = 0;
+    private int scanSizeWidth = SCAN_PREVIEW_WIDTH;
+    private int scanSizeHeight = SCAN_PREVIEW_HEIGHT;
+    // Slightly-negative AE compensation for scan stills (harder bar contrast, less blur);
+    // clamped to the device's supported range at scan start. This device: [-4,+4] @ 1/2 EV.
+    private int scanAeCompensation = -4;
+
+    // DIM-560 continuous sweep scan: same open-camera session, but each still is SAVED and
+    // ML Kit-decoded on-device, per-frame results written to a session dir, and the run self-stops
+    // at a frame cap or on first decode. The camera stays open across frames (no take_photo cold
+    // start), so cadence is far higher than the host-driven one-photo-at-a-time loop.
+    private volatile boolean sweepActive = false;
+    private File sweepDir;
+    private int sweepMaxFrames = 35;
+    private boolean sweepStopOnFound = true;
+    private int sweepAfSettleMs = 200;   // MIN settle before honoring an AF lock (or fixed delay)
+    private int sweepFrameCount = 0;
+    private int sweepHitFrame = -1;
+    private long sweepLastFrameAt = 0L;
+    // Focus-lock: instead of a blind fixed delay, wait for the AF to actually converge (sharp
+    // frames) before each still — capped by sweepAfMaxMs so a code the AF can't lock still shoots.
+    private boolean sweepAfLock = true;
+    private int sweepAfMaxMs = 1000;
+    private volatile boolean scanAwaitingAf = false;
+    private long scanAfTriggeredAt = 0L;
+
+    // User feedback sounds (assets/): a code locked, or the sweep ended with nothing found.
+    private static final String SCAN_SOUND_SUCCESS = "scan_success.wav";
+    private static final String SCAN_SOUND_FAIL = "scan_fail.wav";
+
+    /** Fire-and-forget one-shot feedback tone from assets so the user knows the scan's outcome. */
+    private void playFeedback(String assetName) {
+        try {
+            MediaPlayer mp = new MediaPlayer();
+            AssetFileDescriptor afd = getAssets().openFd(assetName);
+            mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+            afd.close();
+            mp.setOnCompletionListener(MediaPlayer::release);
+            mp.setOnErrorListener(
+                    (m, what, extra) -> {
+                        m.release();
+                        return true;
+                    });
+            mp.prepare();
+            mp.start();
+        } catch (Exception e) {
+            Log.w(BarcodeScanController.TAG, "feedback sound failed: " + assetName, e);
+        }
+    }
+
+    /** Fires the still capture once (guards against the AF-monitor and the timeout racing). */
+    private void fireScanStill() {
+        if (!scanAwaitingAf) {
+            return;
+        }
+        scanAwaitingAf = false;
+        if (backgroundHandler != null) {
+            backgroundHandler.removeCallbacks(scanAfTimeoutRunnable);
+        }
+        doScanStillCapture();
+    }
+
+    private final Runnable scanAfTimeoutRunnable = this::fireScanStill;
+
+    /** Watches AF state on the preview stream; captures the still the moment focus converges. */
+    private final CameraCaptureSession.CaptureCallback scanAfMonitor =
+            new CameraCaptureSession.CaptureCallback() {
+                @Override
+                public void onCaptureCompleted(
+                        @NonNull CameraCaptureSession s,
+                        @NonNull CaptureRequest req,
+                        @NonNull TotalCaptureResult result) {
+                    if (!scanning || !scanAwaitingAf) {
+                        return;
+                    }
+                    Integer af = result.get(CaptureResult.CONTROL_AF_STATE);
+                    long elapsed = System.currentTimeMillis() - scanAfTriggeredAt;
+                    boolean locked =
+                            af != null
+                                    && (af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+                                            || af == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED);
+                    // Require a minimum settle so we don't fire on a stale lock from the prior cycle.
+                    if (af == null || (locked && elapsed >= sweepAfSettleMs)) {
+                        fireScanStill();
+                    }
+                }
+            };
 
     // Photo resolution and quality constants are defined in CameraConstants.java
 
@@ -141,6 +251,41 @@ public class CameraNeoService extends LifecycleService {
     public static final String EXTRA_VIDEO_FILE_PATH = "com.augmentos.camera.EXTRA_VIDEO_FILE_PATH";
     public static final String EXTRA_VIDEO_ID = "com.augmentos.camera.EXTRA_VIDEO_ID";
     public static final String EXTRA_VIDEO_SETTINGS = "com.augmentos.camera.EXTRA_VIDEO_SETTINGS";
+    // DIM-560 glasses-native barcode scanner (Phase 0 spike). A preview-only scan session:
+    // opens the camera through the same coordinator (so it can't collide with photo/video),
+    // runs a continuous YUV preview, and decodes each frame on-device with ZXing.
+    public static final String ACTION_START_BARCODE_SCAN =
+            "com.augmentos.camera.ACTION_START_BARCODE_SCAN";
+    public static final String ACTION_STOP_BARCODE_SCAN =
+            "com.augmentos.camera.ACTION_STOP_BARCODE_SCAN";
+    // DIM-560 continuous sweep scan: continuous session that saves + ML Kit-decodes each still
+    // and writes per-frame results, self-stopping at a frame cap / first decode.
+    public static final String ACTION_START_BARCODE_SWEEP =
+            "com.augmentos.camera.ACTION_START_BARCODE_SWEEP";
+    public static final String EXTRA_SWEEP_DIR = "sweep_dir";
+    public static final String EXTRA_SWEEP_MAX = "sweep_max";
+    public static final String EXTRA_SWEEP_STOP_ON_FOUND = "sweep_stop_on_found";
+    public static final String EXTRA_SWEEP_AF_SETTLE = "sweep_af_settle";
+    public static final String EXTRA_SWEEP_AF_LOCK = "sweep_af_lock";
+    public static final String EXTRA_SWEEP_AF_MAX = "sweep_af_max";
+    // Scan preview resolution — bigger than the 320x240 photo-AE preview so small/1D codes at
+    // arm's length stay legible, still cheap to decode.
+    private static final int SCAN_PREVIEW_WIDTH = 640;
+    private static final int SCAN_PREVIEW_HEIGHT = 480;
+    // Delay between full-res snapshots (after the previous one finishes decoding) — the loop
+    // is self-paced by decode time, so this is just breathing room for AE/AF.
+    private static final long SCAN_STILL_INTERVAL_MS = 120;
+    // Still-capture size cap. Codes here are curved/awkward, so favor resolution (8MP) for
+    // margin; decode is slower but consensus needs the detail. 4032x3024 is available but
+    // 12MP decode is too slow for a snapshot loop.
+    private static final int SCAN_STILL_MAX_W = 3264;
+    private static final int SCAN_STILL_MAX_H = 2448;
+    // Continuous sweep scan uses a smaller still: ML Kit reads reliably at ~1200-2000px (and can
+    // silently fail near full-res), and a smaller frame captures + saves faster → higher cadence.
+    private static final int SWEEP_STILL_MAX_W = 1920;
+    private static final int SWEEP_STILL_MAX_H = 1440;
+    // AF settle after the trigger before snapshotting.
+    private static final long SCAN_AF_SETTLE_MS = 500;
 
     // Callback interface for photo capture
     public interface PhotoCaptureCallback {
@@ -672,6 +817,20 @@ public class CameraNeoService extends LifecycleService {
         context.startForegroundService(intent);
     }
 
+    /** DIM-560 spike: start on-glasses barcode/QR scanning (preview-only, decode on-device). */
+    public static void startBarcodeScan(Context context) {
+        Intent intent = new Intent(context, CameraNeoService.class);
+        intent.setAction(ACTION_START_BARCODE_SCAN);
+        context.startForegroundService(intent);
+    }
+
+    /** DIM-560 spike: stop barcode scanning and release the camera. */
+    public static void stopBarcodeScan(Context context) {
+        Intent intent = new Intent(context, CameraNeoService.class);
+        intent.setAction(ACTION_STOP_BARCODE_SCAN);
+        context.startForegroundService(intent);
+    }
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         super.onStartCommand(intent, flags, startId);
@@ -721,6 +880,16 @@ public class CameraNeoService extends LifecycleService {
                     String videoIdToStop = intent.getStringExtra(EXTRA_VIDEO_ID);
                     videoSession.stopRecording(videoIdToStop);
                     SystemControllerFactory.get(this).setEisEnabled(false);
+                    break;
+                case ACTION_START_BARCODE_SCAN:
+                    sweepActive = false;
+                    openCameraForScan();
+                    break;
+                case ACTION_START_BARCODE_SWEEP:
+                    startBarcodeSweep(intent);
+                    break;
+                case ACTION_STOP_BARCODE_SCAN:
+                    stopScan();
                     break;
             }
         }
@@ -1014,6 +1183,636 @@ public class CameraNeoService extends LifecycleService {
                 stopSelf();
             }
         };
+    }
+
+    // ===================================================================================
+    // DIM-560 — barcode scan session (Phase 0 spike)
+    //
+    // A preview-only camera session, deliberately independent of the photo/video paths:
+    // its own YUV ImageReader + repeating TEMPLATE_PREVIEW request, decoded on-device by
+    // ZXing. It goes through the SAME cameraCoordinator open/close lock as photo/video, so
+    // the three modes can never own the camera at once. No still capture, nothing saved.
+    // ===================================================================================
+
+    /**
+     * DIM-560 continuous sweep scan: start the open-camera scan session in sweep mode — each
+     * still is saved + ML Kit-decoded on-device, per-frame results are written to {@code sweepDir},
+     * and the run self-stops at {@code sweep_max} frames or on first decode. Reuses the whole scan
+     * session; only decodeScanFrame branches on {@link #sweepActive}.
+     */
+    private void startBarcodeSweep(Intent intent) {
+        if (scanning) {
+            Log.i(BarcodeScanController.TAG, "scan already active — ignoring sweep start");
+            return;
+        }
+        String dir = intent.getStringExtra(EXTRA_SWEEP_DIR);
+        if (dir == null || dir.isEmpty()) {
+            dir = new File(getExternalFilesDir(null), "barcode_sweep").getAbsolutePath();
+        }
+        sweepDir = new File(dir);
+        if (!sweepDir.exists()) {
+            sweepDir.mkdirs();
+        }
+        sweepMaxFrames = Math.max(1, intent.getIntExtra(EXTRA_SWEEP_MAX, 35));
+        sweepStopOnFound = intent.getBooleanExtra(EXTRA_SWEEP_STOP_ON_FOUND, true);
+        sweepAfSettleMs = Math.max(0, intent.getIntExtra(EXTRA_SWEEP_AF_SETTLE, 200));
+        sweepAfLock = intent.getBooleanExtra(EXTRA_SWEEP_AF_LOCK, true);
+        sweepAfMaxMs = Math.max(sweepAfSettleMs, intent.getIntExtra(EXTRA_SWEEP_AF_MAX, 1000));
+        sweepFrameCount = 0;
+        sweepHitFrame = -1;
+        sweepLastFrameAt = 0L;
+        scanAwaitingAf = false;
+        sweepActive = true;
+        writeSweepStatus(false);
+        Log.i(BarcodeScanController.TAG, "sweep scan start dir=" + sweepDir
+                + " max=" + sweepMaxFrames + " stopOnFound=" + sweepStopOnFound
+                + " afSettle=" + sweepAfSettleMs);
+        openCameraForScan();
+    }
+
+    /** One sweep frame: save the still, ML Kit-decode it, append a per-frame record, bound the run. */
+    private void handleSweepFrame(Image image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        long now = System.currentTimeMillis();
+        long sincePrev = sweepLastFrameAt == 0 ? 0 : (now - sweepLastFrameAt);
+        sweepLastFrameAt = now;
+        sweepFrameCount++;
+        int n = sweepFrameCount;
+
+        byte[] nv21 = yuv420ToNv21(image);
+        long t0 = System.currentTimeMillis();
+        java.util.List<String> raw =
+                scanController != null
+                        ? scanController.decodeMlKitRaw(nv21, width, height)
+                        : new java.util.ArrayList<>();
+        long decodeMs = System.currentTimeMillis() - t0;
+        boolean found = !raw.isEmpty();
+
+        // Save the frame JPEG (same NV21 -> JPEG path as the diagnostic dump).
+        String file = "frame_" + String.format(java.util.Locale.US, "%02d", n) + ".jpg";
+        try {
+            YuvImage yuv = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
+            File out = new File(sweepDir, file);
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
+                yuv.compressToJpeg(new Rect(0, 0, width, height), 90, fos);
+            }
+        } catch (Exception e) {
+            Log.w(BarcodeScanController.TAG, "sweep frame save failed", e);
+        }
+
+        // Append a per-frame JSONL record.
+        try {
+            org.json.JSONArray vals = new org.json.JSONArray();
+            for (String r : raw) {
+                int bar = r.indexOf('|');
+                org.json.JSONObject v = new org.json.JSONObject();
+                v.put("format", bar >= 0 ? r.substring(0, bar) : "?");
+                v.put("value", bar >= 0 ? r.substring(bar + 1) : r);
+                vals.put(v);
+            }
+            org.json.JSONObject rec = new org.json.JSONObject();
+            rec.put("n", n).put("ts", now).put("since_prev_ms", sincePrev)
+                    .put("decode_ms", decodeMs).put("w", width).put("h", height)
+                    .put("found", found).put("file", file).put("values", vals);
+            try (java.io.FileWriter w = new java.io.FileWriter(new File(sweepDir, "results.jsonl"), true)) {
+                w.write(rec.toString() + "\n");
+            }
+        } catch (Exception e) {
+            Log.w(BarcodeScanController.TAG, "sweep record write failed", e);
+        }
+
+        if (found && sweepHitFrame < 0) {
+            sweepHitFrame = n;
+            playFeedback(SCAN_SOUND_SUCCESS);  // first lock — tell the user it worked
+        }
+        Log.i(BarcodeScanController.TAG, "SWEEP n=" + n + " dt=" + sincePrev
+                + "ms decode=" + decodeMs + "ms found=" + found + " " + raw);
+
+        boolean stop = (sweepStopOnFound && found) || n >= sweepMaxFrames;
+        // Sweep exhausted with nothing found → failure feedback so the user isn't left guessing.
+        if (stop && sweepHitFrame < 0) {
+            playFeedback(SCAN_SOUND_FAIL);
+        }
+        writeSweepStatus(stop);
+        if (stop && backgroundHandler != null) {
+            backgroundHandler.post(this::stopScan);
+        }
+    }
+
+    /** Write the live status file the host polls: frames done, hit frame, done flag. */
+    private void writeSweepStatus(boolean done) {
+        if (sweepDir == null) {
+            return;
+        }
+        try {
+            org.json.JSONObject o = new org.json.JSONObject();
+            o.put("frames", sweepFrameCount);
+            o.put("max_frames", sweepMaxFrames);
+            o.put("found", sweepHitFrame > 0);
+            o.put("hit_frame", sweepHitFrame);
+            o.put("done", done);
+            File tmp = new File(sweepDir, "status.json.tmp");
+            try (java.io.FileWriter w = new java.io.FileWriter(tmp)) {
+                w.write(o.toString());
+            }
+            tmp.renameTo(new File(sweepDir, "status.json"));
+        } catch (Exception e) {
+            Log.w(BarcodeScanController.TAG, "sweep status write failed", e);
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void openCameraForScan() {
+        if (scanning) {
+            Log.i(BarcodeScanController.TAG, "scan already active — ignoring start");
+            return;
+        }
+        CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+        if (manager == null) {
+            Log.e(BarcodeScanController.TAG, "Camera service unavailable");
+            conditionalStopSelf();
+            return;
+        }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M
+                && checkSelfPermission(android.Manifest.permission.CAMERA)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            Log.e(BarcodeScanController.TAG, "Camera permission not granted");
+            conditionalStopSelf();
+            return;
+        }
+        try {
+            this.cameraId = CameraOpener.selectPrimaryCameraId(manager);
+            if (this.cameraId == null) {
+                Log.e(BarcodeScanController.TAG, "No suitable camera found");
+                conditionalStopSelf();
+                return;
+            }
+
+            scanController =
+                    new BarcodeScanController(
+                            (value, format) ->
+                                    // Phase 1 will forward this over BLE; Phase 0 just proves the
+                                    // decode loop, so the controller already logged it.
+                                    Log.d(
+                                            BarcodeScanController.TAG,
+                                            "sink: " + format + " -> " + value));
+
+            // This HAL only tolerates a SMALL repeating stream (it crashes — "camera provider
+            // has died" — above ~640x480). So: a tiny repeating preview drives AE/AF, and the
+            // real resolution comes from periodic full-res STILL captures that we decode. This
+            // matches the product model (say "scan" -> snapshots -> find any code anywhere).
+            scanPreviewReader =
+                    ImageReader.newInstance(
+                            SCAN_PREVIEW_WIDTH, SCAN_PREVIEW_HEIGHT, ImageFormat.YUV_420_888, 2);
+            scanPreviewReader.setOnImageAvailableListener(
+                    reader -> {
+                        // Preview only keeps AE/AF alive; drain it, don't decode.
+                        try (Image image = reader.acquireLatestImage()) {
+                            // discard
+                        } catch (RuntimeException ignored) {
+                        }
+                    },
+                    backgroundHandler);
+
+            // Still reader: the largest LANDSCAPE YUV size within the cap. Still capture
+            // supports the big sizes (unlike the repeating preview) — this is what we decode.
+            Size stillSize = new Size(SCAN_PREVIEW_WIDTH, SCAN_PREVIEW_HEIGHT);
+            try {
+                CameraCharacteristics ch = manager.getCameraCharacteristics(cameraId);
+                StreamConfigurationMap scMap =
+                        ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+                if (scMap != null) {
+                    Size[] yuvSizes = scMap.getOutputSizes(ImageFormat.YUV_420_888);
+                    if (yuvSizes != null && yuvSizes.length > 0) {
+                        Log.i(
+                                BarcodeScanController.TAG,
+                                "available YUV_420_888 sizes: " + Arrays.toString(yuvSizes));
+                        int capW = sweepActive ? SWEEP_STILL_MAX_W : SCAN_STILL_MAX_W;
+                        int capH = sweepActive ? SWEEP_STILL_MAX_H : SCAN_STILL_MAX_H;
+                        Size best = null;
+                        for (Size s : yuvSizes) {
+                            if (s.getWidth() > capW
+                                    || s.getHeight() > capH
+                                    || s.getWidth() < s.getHeight()) {
+                                continue;
+                            }
+                            long area = (long) s.getWidth() * s.getHeight();
+                            if (best == null
+                                    || area > (long) best.getWidth() * best.getHeight()) {
+                                best = s;
+                            }
+                        }
+                        if (best != null) {
+                            stillSize = best;
+                        }
+                    }
+                }
+                // Clamp the scan AE compensation to what this camera supports.
+                android.util.Range<Integer> aeRange =
+                        ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+                if (aeRange != null) {
+                    scanAeCompensation =
+                            Math.max(aeRange.getLower(), Math.min(scanAeCompensation, aeRange.getUpper()));
+                }
+            } catch (Exception e) {
+                Log.w(BarcodeScanController.TAG, "still YUV size query failed; using default", e);
+            }
+            scanSizeWidth = stillSize.getWidth();
+            scanSizeHeight = stillSize.getHeight();
+            Log.i(
+                    BarcodeScanController.TAG,
+                    "scan STILL resolution: "
+                            + scanSizeWidth
+                            + "x"
+                            + scanSizeHeight
+                            + " (preview "
+                            + SCAN_PREVIEW_WIDTH
+                            + "x"
+                            + SCAN_PREVIEW_HEIGHT
+                            + ")");
+            scanStillReader =
+                    ImageReader.newInstance(
+                            scanSizeWidth, scanSizeHeight, ImageFormat.YUV_420_888, 2);
+            scanStillReader.setOnImageAvailableListener(
+                    reader -> {
+                        try (Image image = reader.acquireLatestImage()) {
+                            if (image != null && scanning) {
+                                decodeScanFrame(image);
+                            }
+                        } catch (RuntimeException e) {
+                            Log.w(BarcodeScanController.TAG, "still acquire/decode fault", e);
+                        }
+                        // Self-paced: schedule the next snapshot only after this one decoded.
+                        if (scanning && backgroundHandler != null) {
+                            backgroundHandler.postDelayed(
+                                    this::captureScanStill, SCAN_STILL_INTERVAL_MS);
+                        }
+                    },
+                    backgroundHandler);
+
+            // EIS adds HAL load/heat (the streaming path disables it too); a scanner doesn't
+            // need stabilization. Helps HAL stability at higher preview resolutions.
+            try {
+                SystemControllerFactory.get(this).setEisEnabled(false);
+            } catch (Exception ignored) {
+            }
+
+            if (!cameraCoordinator.tryAcquireOpenCloseLock(2500)) {
+                throw new RuntimeException("Timed out acquiring camera lock for scan");
+            }
+            scanning = true;
+            scanStartedAt = System.currentTimeMillis();
+            scanFrameIndex = 0;
+            scanDumpsWritten = 0;
+            Log.i(
+                    BarcodeScanController.TAG,
+                    "starting scan session — camera "
+                            + cameraId
+                            + " @ "
+                            + SCAN_PREVIEW_WIDTH
+                            + "x"
+                            + SCAN_PREVIEW_HEIGHT);
+            manager.openCamera(this.cameraId, newScanCameraStateCallback(), backgroundHandler);
+        } catch (CameraAccessException e) {
+            Log.e(BarcodeScanController.TAG, "camera access error starting scan", e);
+            stopScan();
+        } catch (Exception e) {
+            Log.e(BarcodeScanController.TAG, "error starting scan", e);
+            stopScan();
+        }
+    }
+
+    private CameraDevice.StateCallback newScanCameraStateCallback() {
+        return new CameraDevice.StateCallback() {
+            @Override
+            public void onOpened(@NonNull CameraDevice camera) {
+                cameraCoordinator.releaseOpenCloseLock();
+                cameraCoordinator.setDevice(camera);
+                createScanSession();
+            }
+
+            @Override
+            public void onDisconnected(@NonNull CameraDevice camera) {
+                cameraCoordinator.releaseOpenCloseLock();
+                camera.close();
+                cameraCoordinator.clearDevice();
+                Log.w(BarcodeScanController.TAG, "scan camera disconnected");
+                stopScan();
+            }
+
+            @Override
+            public void onError(@NonNull CameraDevice camera, int error) {
+                cameraCoordinator.releaseOpenCloseLock();
+                camera.close();
+                cameraCoordinator.clearDevice();
+                Log.e(BarcodeScanController.TAG, "scan camera error: " + error);
+                stopScan();
+            }
+        };
+    }
+
+    private void createScanSession() {
+        try {
+            CameraDevice device = cameraCoordinator.device();
+            if (device == null || scanPreviewReader == null || scanStillReader == null) {
+                Log.e(BarcodeScanController.TAG, "scan session: device/reader null");
+                stopScan();
+                return;
+            }
+            Surface previewSurface = scanPreviewReader.getSurface();
+            Surface stillSurface = scanStillReader.getSurface();
+            previewBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            previewBuilder.addTarget(previewSurface);
+            // Continuous auto-exposure + continuous AF for a moving hands-free view.
+            previewBuilder.set(
+                    CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
+            previewBuilder.set(
+                    CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+            if (hasAutoFocus) {
+                previewBuilder.set(
+                        CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+            }
+
+            CameraCaptureSession.StateCallback cb =
+                    new CameraCaptureSession.StateCallback() {
+                        @Override
+                        public void onConfigured(@NonNull CameraCaptureSession session) {
+                            Handler handler;
+                            synchronized (SERVICE_LOCK) {
+                                handler = backgroundHandler;
+                                if (handler == null || cameraCoordinator.device() == null) {
+                                    session.close();
+                                    return;
+                                }
+                                cameraCoordinator.setSession(session);
+                            }
+                            try {
+                                // Small repeating preview keeps AE/AF converged (HAL-safe size).
+                                session.setRepeatingRequest(
+                                        previewBuilder.build(), null, handler);
+                                Log.i(
+                                        BarcodeScanController.TAG,
+                                        "scan session LIVE — snapshotting @ "
+                                                + scanSizeWidth
+                                                + "x"
+                                                + scanSizeHeight);
+                                // Let the preview's auto-exposure/focus converge (~1s) before
+                                // the first snapshot, so it isn't dark/blurry. Then the loop is
+                                // self-paced by decode time.
+                                handler.postDelayed(
+                                        CameraNeoService.this::captureScanStill, 1000);
+                            } catch (CameraAccessException e) {
+                                Log.e(BarcodeScanController.TAG, "setRepeatingRequest failed", e);
+                                stopScan();
+                            }
+                        }
+
+                        @Override
+                        public void onConfigureFailed(@NonNull CameraCaptureSession session) {
+                            Log.e(BarcodeScanController.TAG, "scan session configure failed");
+                            stopScan();
+                        }
+                    };
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                List<OutputConfiguration> outs = new ArrayList<>();
+                outs.add(new OutputConfiguration(previewSurface));
+                outs.add(new OutputConfiguration(stillSurface));
+                Executor exec =
+                        backgroundHandler != null
+                                ? new HandlerExecutor(backgroundHandler)
+                                : executor;
+                device.createCaptureSession(
+                        new SessionConfiguration(
+                                SessionConfiguration.SESSION_REGULAR, outs, exec, cb));
+            } else {
+                List<Surface> surfaces = new ArrayList<>();
+                surfaces.add(previewSurface);
+                surfaces.add(stillSurface);
+                device.createCaptureSession(surfaces, cb, backgroundHandler);
+            }
+        } catch (CameraAccessException e) {
+            Log.e(BarcodeScanController.TAG, "scan session access error", e);
+            stopScan();
+        }
+    }
+
+    /**
+     * One snapshot cycle: force an autofocus scan, let it settle, THEN take the full-res still.
+     * Continuous AF alone wasn't locking on close/low-contrast codes (blurry stills that no
+     * decoder could read), so we explicitly trigger AF before each capture.
+     */
+    private void captureScanStill() {
+        if (!scanning) {
+            return;
+        }
+        CameraCaptureSession session = cameraCoordinator.session();
+        CameraDevice device = cameraCoordinator.device();
+        if (session == null || device == null || scanStillReader == null || previewBuilder == null) {
+            return;
+        }
+        try {
+            // Kick a fresh AF scan on the preview stream...
+            previewBuilder.set(
+                    CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START);
+            if (sweepActive && sweepAfLock) {
+                // Focus-lock: capture as soon as AF actually converges (watched by scanAfMonitor),
+                // with sweepAfMaxMs as a hard fallback. Sharper stills than a blind fixed delay.
+                scanAwaitingAf = true;
+                scanAfTriggeredAt = System.currentTimeMillis();
+                session.capture(previewBuilder.build(), scanAfMonitor, backgroundHandler);
+                previewBuilder.set(
+                        CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE);
+                session.setRepeatingRequest(previewBuilder.build(), scanAfMonitor, backgroundHandler);
+                backgroundHandler.postDelayed(scanAfTimeoutRunnable, sweepAfMaxMs);
+            } else {
+                session.capture(previewBuilder.build(), null, backgroundHandler);
+                previewBuilder.set(
+                        CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE);
+                session.setRepeatingRequest(previewBuilder.build(), null, backgroundHandler);
+                // ...then snapshot after a fixed settle (interactive scan, or sweep with lock off).
+                long settle = sweepActive ? sweepAfSettleMs : SCAN_AF_SETTLE_MS;
+                backgroundHandler.postDelayed(this::doScanStillCapture, settle);
+            }
+        } catch (CameraAccessException e) {
+            Log.e(BarcodeScanController.TAG, "AF trigger failed", e);
+        } catch (IllegalStateException e) {
+            // Session closed under us (stop raced the capture) — benign.
+        }
+    }
+
+    private void doScanStillCapture() {
+        if (!scanning) {
+            return;
+        }
+        CameraCaptureSession session = cameraCoordinator.session();
+        CameraDevice device = cameraCoordinator.device();
+        if (session == null || device == null || scanStillReader == null) {
+            return;
+        }
+        try {
+            // TEMPLATE_VIDEO_SNAPSHOT: a still grabbed WHILE a preview runs inherits the
+            // converged auto-exposure (STILL_CAPTURE would need a separate AE precapture).
+            CaptureRequest.Builder b =
+                    device.createCaptureRequest(CameraDevice.TEMPLATE_VIDEO_SNAPSHOT);
+            b.addTarget(scanStillReader.getSurface());
+            b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
+            b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+            // Adopt Mentra's scan/document tuning (PhotoCaptureSettings): edge enhancement and
+            // noise reduction OFF. On fine barcode bars, edge-enhancement rings and multi-frame
+            // NR (MFNR) smears — both corrupt bar widths. Slightly negative exposure hardens the
+            // black/white transitions and trims motion blur.
+            b.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF);
+            b.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF);
+            b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, scanAeCompensation);
+            if (hasAutoFocus) {
+                // AUTO holds the focus the trigger just locked (don't let continuous AF drift
+                // the lens between the lock and the capture).
+                b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO);
+            }
+            session.capture(b.build(), null, backgroundHandler);
+        } catch (CameraAccessException e) {
+            Log.e(BarcodeScanController.TAG, "still capture failed", e);
+        } catch (IllegalStateException e) {
+            // Session closed under us — benign.
+        }
+    }
+
+    /** Extract the Y (luminance) plane and hand it to ZXing. */
+    private void decodeScanFrame(Image image) {
+        // Continuous sweep mode owns the frame: save + ML Kit-decode + record, then bound.
+        if (sweepActive) {
+            handleSweepFrame(image);
+            return;
+        }
+        int width = image.getWidth();
+        int height = image.getHeight();
+
+        // Diagnostic frame dump (spike only): write a few frames as JPEG so we can eyeball
+        // what the camera is actually seeing.
+        if (SCAN_DUMP_FRAMES
+                && scanDumpsWritten < SCAN_DUMP_MAX
+                && (scanFrameIndex % SCAN_DUMP_EVERY == 0)) {
+            dumpScanFrameJpeg(image, scanFrameIndex);
+        }
+        scanFrameIndex++;
+
+        if (scanController == null) {
+            return;
+        }
+        // ML Kit wants NV21 (or a media Image). Build NV21 and let ML Kit locate+decode — it
+        // handles off-center/angled/curved codes robustly and runs fully on-device (no GMS).
+        byte[] nv21 = yuv420ToNv21(image);
+        scanController.decodeMlKit(nv21, width, height, System.currentTimeMillis());
+    }
+
+    /** YUV_420_888 → NV21 → JPEG on disk (diagnostic only). */
+    private void dumpScanFrameJpeg(Image image, int index) {
+        try {
+            int width = image.getWidth();
+            int height = image.getHeight();
+            byte[] nv21 = yuv420ToNv21(image);
+            YuvImage yuv = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
+            File dir = new File(getExternalFilesDir(null), "scan_debug");
+            if (!dir.exists()) {
+                dir.mkdirs();
+            }
+            File out = new File(dir, "frame_" + index + ".jpg");
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
+                yuv.compressToJpeg(new Rect(0, 0, width, height), 90, fos);
+            }
+            scanDumpsWritten++;
+            Log.i(
+                    BarcodeScanController.TAG,
+                    "dumped frame " + index + " -> " + out.getAbsolutePath());
+        } catch (Exception e) {
+            Log.w(BarcodeScanController.TAG, "frame dump failed", e);
+        }
+    }
+
+    /** Pack a YUV_420_888 Image into an NV21 byte array (Y plane, then interleaved V,U). */
+    private static byte[] yuv420ToNv21(Image image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        Image.Plane[] planes = image.getPlanes();
+        byte[] nv21 = new byte[width * height * 3 / 2];
+
+        // Y
+        java.nio.ByteBuffer yBuf = planes[0].getBuffer();
+        int yRowStride = planes[0].getRowStride();
+        int pos = 0;
+        for (int row = 0; row < height; row++) {
+            int rowStart = row * yRowStride;
+            yBuf.position(rowStart);
+            yBuf.get(nv21, pos, width);
+            pos += width;
+        }
+
+        // VU interleaved (NV21 = Y + V,U,V,U...)
+        java.nio.ByteBuffer uBuf = planes[1].getBuffer();
+        java.nio.ByteBuffer vBuf = planes[2].getBuffer();
+        int uvRowStride = planes[1].getRowStride();
+        int uvPixelStride = planes[1].getPixelStride();
+        int cHeight = height / 2;
+        int cWidth = width / 2;
+        for (int row = 0; row < cHeight; row++) {
+            for (int col = 0; col < cWidth; col++) {
+                int uvIndex = row * uvRowStride + col * uvPixelStride;
+                vBuf.position(uvIndex);
+                nv21[pos++] = vBuf.get();
+                uBuf.position(uvIndex);
+                nv21[pos++] = uBuf.get();
+            }
+        }
+        return nv21;
+    }
+
+    private void stopScan() {
+        boolean wasScanning = scanning;
+        scanning = false;
+        scanAwaitingAf = false;
+        if (backgroundHandler != null) {
+            backgroundHandler.removeCallbacks(scanAfTimeoutRunnable);
+        }
+        if (sweepActive) {
+            writeSweepStatus(true);  // mark the run done so the host stops polling
+            sweepActive = false;
+        }
+        if (wasScanning && scanController != null) {
+            long elapsedMs = System.currentTimeMillis() - scanStartedAt;
+            Log.i(
+                    BarcodeScanController.TAG,
+                    "stopping scan — "
+                            + scanController.framesSeen()
+                            + " frames, "
+                            + scanController.decodeCount()
+                            + " decodes over "
+                            + elapsedMs
+                            + "ms");
+        }
+        closeCamera();
+        try {
+            SystemControllerFactory.get(this).setEisEnabled(true); // restore default
+        } catch (Exception ignored) {
+        }
+        if (scanPreviewReader != null) {
+            try {
+                scanPreviewReader.close();
+            } catch (RuntimeException ignored) {
+            }
+            scanPreviewReader = null;
+        }
+        if (scanStillReader != null) {
+            try {
+                scanStillReader.close();
+            } catch (RuntimeException ignored) {
+            }
+            scanStillReader = null;
+        }
+        scanController = null;
+        conditionalStopSelf();
     }
 
     private void createCameraSessionInternal(boolean forVideo) {

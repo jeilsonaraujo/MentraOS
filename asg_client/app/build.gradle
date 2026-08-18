@@ -315,6 +315,11 @@ android {
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
 
+    // DIM-560 glasses-native barcode/QR scanning. BUNDLED ML Kit barcode scanner: the model is
+    // statically linked into the APK, so it runs fully on-device with NO Google Play Services (this
+    // glasses build is GMS-less). Validated as the best decoder for curved/soft/angled real-world
+    // codes; ZXing and the Scanbot benchmark SDK were evaluated and dropped.
+    implementation 'com.google.mlkit:barcode-scanning:17.3.0'
     implementation 'com.google.android.material:material:1.8.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
@@ -466,7 +471,9 @@ tasks.register('checkNoFullyQualifiedMentraTypes') {
             }
         }
         if (!violations.isEmpty()) {
-            throw new GradleException(
+            // Plain RuntimeException (not GradleException) so editors' Groovy analyzers, which
+            // don't load the Gradle API, don't flag it as unresolved — fails the build identically.
+            throw new RuntimeException(
                     'Use imports instead of fully-qualified com.mentra.asg_client types: '
                             + violations.join(', '))
         }
