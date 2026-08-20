@@ -24,6 +24,7 @@ import android.hardware.camera2.params.SessionConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.os.Build;
 import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.util.Range;
 import android.util.Rational;
@@ -181,23 +182,44 @@ public class CameraNeoService extends LifecycleService {
 
     /** Fire-and-forget one-shot feedback tone from assets so the user knows the scan's outcome. */
     private void playFeedback(String assetName) {
-        try {
-            MediaPlayer mp = new MediaPlayer();
-            AssetFileDescriptor afd = getAssets().openFd(assetName);
-            mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
-            afd.close();
-            mp.setOnCompletionListener(MediaPlayer::release);
-            mp.setOnErrorListener(
-                    (m, what, extra) -> {
-                        m.release();
-                        return true;
-                    });
-            mp.prepare();
-            mp.start();
-        } catch (Exception e) {
-            Log.w(BarcodeScanController.TAG, "feedback sound failed: " + assetName, e);
-        }
+        // Run on the MAIN looper, not the caller's thread. The sweep decode path
+        // calls this immediately before stopScan() quits the camera background
+        // thread; a MediaPlayer created on that thread loses its event Looper the
+        // instant the thread dies ("sending message to a dead thread" /
+        // "finalized without being released") and the clip never actually sounds.
+        // The main looper outlives the scan, and the field reference keeps the
+        // player alive through playback so it is not GC'd mid-clip.
+        new Handler(Looper.getMainLooper()).post(() -> {
+            try {
+                if (feedbackPlayer != null) {
+                    try { feedbackPlayer.release(); } catch (Exception ignored) {}
+                    feedbackPlayer = null;
+                }
+                MediaPlayer mp = new MediaPlayer();
+                AssetFileDescriptor afd = getAssets().openFd(assetName);
+                mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+                afd.close();
+                mp.setOnCompletionListener(m -> {
+                    m.release();
+                    if (feedbackPlayer == m) feedbackPlayer = null;
+                });
+                mp.setOnErrorListener(
+                        (m, what, extra) -> {
+                            m.release();
+                            if (feedbackPlayer == m) feedbackPlayer = null;
+                            return true;
+                        });
+                feedbackPlayer = mp;
+                mp.prepare();
+                mp.start();
+            } catch (Exception e) {
+                Log.w(BarcodeScanController.TAG, "feedback sound failed: " + assetName, e);
+            }
+        });
     }
+
+    /** Held so a feedback clip is not GC'd/torn down mid-playback (see playFeedback). */
+    private MediaPlayer feedbackPlayer;
 
     /** Fires the still capture once (guards against the AF-monitor and the timeout racing). */
     private void fireScanStill() {
