@@ -3,8 +3,14 @@
     xmlns:tools="http://schemas.android.com/tools"
     package="com.mentra.asg_client">
 
+    <!-- Scoped to ${applicationId}, like the FileProvider authority below, and for
+         the same reason: a permission name is global to the device. The name used
+         to be hardcoded, so the `.thirdparty` build redeclared a permission the
+         stock (Mentra-signed) com.mentra.asg_client already owned and Android
+         refused the install outright with INSTALL_FAILED_DUPLICATE_PERMISSION.
+         For the stock build this expands to exactly the previous name. -->
     <permission
-        android:name="com.mentra.asg_client.permission.RECOVERY_TELEMETRY"
+        android:name="${applicationId}.permission.RECOVERY_TELEMETRY"
         android:protectionLevel="signature" />
 
     <uses-permission android:name="com.mentra.recovery.permission.HEARTBEAT" />
@@ -221,7 +227,7 @@
             android:name="com.mentra.asg_client.receiver.RecoveryTelemetryReceiver"
             android:enabled="true"
             android:exported="true"
-            android:permission="com.mentra.asg_client.permission.RECOVERY_TELEMETRY">
+            android:permission="${applicationId}.permission.RECOVERY_TELEMETRY">
             <intent-filter>
                 <action android:name="com.mentra.recovery.ACTION_TELEMETRY" />
             </intent-filter>
