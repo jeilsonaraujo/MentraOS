@@ -1392,6 +1392,13 @@ public class CameraNeoService extends LifecycleService {
             Log.i(BarcodeScanController.TAG, "scan already active — ignoring start");
             return;
         }
+        // Wake the device + acquire CPU/screen wake locks before opening the camera.
+        // On an idle/asleep device the camera open is rejected with "disabled by
+        // policy" (ERROR_CAMERA_DISABLED) → the sweep returns 0 frames. The
+        // photo/video path already does this (wakeUpScreen() before
+        // openCameraInternal); the scan path omitting it is why a hands-free
+        // "start scan" captured nothing while the glasses sat idle/asleep.
+        wakeUpScreen();
         CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
         if (manager == null) {
             Log.e(BarcodeScanController.TAG, "Camera service unavailable");
@@ -1858,6 +1865,7 @@ public class CameraNeoService extends LifecycleService {
                             + "ms");
         }
         closeCamera();
+        releaseWakeLocks(); // release the wake lock acquired for the scan
         try {
             SystemControllerFactory.get(this).setEisEnabled(true); // restore default
         } catch (Exception ignored) {
