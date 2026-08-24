@@ -144,6 +144,9 @@ public class CameraNeoService extends LifecycleService {
 
     /** Emit the sweep outcome exactly once (found value, or found=false when exhausted/stopped). */
     private void emitSweepResult(boolean found) {
+        // The result is decided (either way): silence the scanning tick BEFORE the
+        // idempotency check, so even a duplicate call cannot leave it beeping.
+        stopScanBeep();
         if (sweepResultEmitted) {
             return;
         }
@@ -223,6 +226,62 @@ public class CameraNeoService extends LifecycleService {
 
     /** Held so a feedback clip is not GC'd/torn down mid-playback (see playFeedback). */
     private MediaPlayer feedbackPlayer;
+
+    // ── DIM-560 scan-in-progress beep ─────────────────────────────────────────
+    // A soft tick every ~900ms while the sweep runs, so the wearer knows the
+    // scanner is working (a sweep can take up to ~24s when nothing decodes).
+    // Lives on the MAIN looper for the same reason playFeedback does: the sweep
+    // path tears down the camera background thread, and audio scheduled there
+    // dies with it. Stopped the moment the result is decided (emitSweepResult)
+    // so the success/fail clip plays clean, and again in stopScan as a backstop.
+    private static final long SCAN_BEEP_INTERVAL_MS = 900;
+    private static final int SCAN_BEEP_DURATION_MS = 80;
+    private static final int SCAN_BEEP_VOLUME = 70; // 0..100, modest so mic bleed stays low
+    private final Handler scanBeepHandler = new Handler(Looper.getMainLooper());
+    private android.media.ToneGenerator scanBeepTone;
+    private final Runnable scanBeepTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!sweepActive) return; // result landed between ticks — stay silent
+            try {
+                if (scanBeepTone != null) {
+                    scanBeepTone.startTone(
+                            android.media.ToneGenerator.TONE_PROP_BEEP, SCAN_BEEP_DURATION_MS);
+                }
+            } catch (Exception ignored) {
+                // A beep that cannot sound must never break the scan.
+            }
+            scanBeepHandler.postDelayed(this, SCAN_BEEP_INTERVAL_MS);
+        }
+    };
+
+    /** Start the periodic scanning tick (idempotent — restarts the cycle). */
+    private void startScanBeep() {
+        scanBeepHandler.post(() -> {
+            stopScanBeepLocked();
+            try {
+                scanBeepTone = new android.media.ToneGenerator(
+                        android.media.AudioManager.STREAM_MUSIC, SCAN_BEEP_VOLUME);
+            } catch (Exception e) {
+                Log.w(BarcodeScanController.TAG, "scan beep unavailable", e);
+                return;
+            }
+            scanBeepHandler.post(scanBeepTick);
+        });
+    }
+
+    /** Stop the tick and release the tone generator. Safe to call repeatedly. */
+    private void stopScanBeep() {
+        scanBeepHandler.post(this::stopScanBeepLocked);
+    }
+
+    private void stopScanBeepLocked() {
+        scanBeepHandler.removeCallbacks(scanBeepTick);
+        if (scanBeepTone != null) {
+            try { scanBeepTone.release(); } catch (Exception ignored) {}
+            scanBeepTone = null;
+        }
+    }
 
     /**
      * DIM-560 persistence: on a successful decode, copy the hit-frame JPEG out of the
@@ -1355,6 +1414,8 @@ public class CameraNeoService extends LifecycleService {
         sweepLastFrameAt = 0L;
         scanAwaitingAf = false;
         sweepActive = true;
+        // Audible "scanning…" tick until the sweep decides (found / exhausted / stopped).
+        startScanBeep();
         writeSweepStatus(false);
         Log.i(BarcodeScanController.TAG, "sweep scan start dir=" + sweepDir
                 + " max=" + sweepMaxFrames + " stopOnFound=" + sweepStopOnFound
@@ -1917,6 +1978,7 @@ public class CameraNeoService extends LifecycleService {
     }
 
     private void stopScan() {
+        stopScanBeep(); // backstop — emitSweepResult already silenced the normal paths
         boolean wasScanning = scanning;
         scanning = false;
         scanAwaitingAf = false;
