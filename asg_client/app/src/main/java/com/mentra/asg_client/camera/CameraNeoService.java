@@ -59,7 +59,6 @@ import com.mentra.asg_client.settings.VideoSettings;
 import com.mentra.asg_client.utils.WakeLockManager;
 import java.io.File;
 import java.io.IOException;
-import com.mentra.asg_client.io.file.core.FileManagerFactory;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -244,7 +243,12 @@ public class CameraNeoService extends LifecycleService {
                 Log.w(BarcodeScanController.TAG, "hit frame missing, cannot promote: " + hit);
                 return;
             }
-            File mediaRoot = FileManagerFactory.getInstance().getDefaultMediaDirectory();
+            // Resolve the camera media dir directly: FileManagerFactory is never
+            // initialized in this process (nothing else calls getInstance()), so
+            // going through it threw IllegalStateException and every hit frame was
+            // silently lost. Same path FileManagerImpl.getDefaultMediaDirectory()
+            // resolves to: <external-files>/com.mentra.asg_client.camera.
+            File mediaRoot = new File(getExternalFilesDir(null), "com.mentra.asg_client.camera");
             String ts = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date());
             int rand = (int) (Math.random() * 1000);
             // Same dir convention as photo/video: requestId is the LAST "_"-segment.
