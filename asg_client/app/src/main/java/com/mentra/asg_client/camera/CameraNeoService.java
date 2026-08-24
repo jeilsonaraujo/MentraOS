@@ -230,26 +230,45 @@ public class CameraNeoService extends LifecycleService {
     // ── DIM-560 scan-in-progress beep ─────────────────────────────────────────
     // A soft tick every ~900ms while the sweep runs, so the wearer knows the
     // scanner is working (a sweep can take up to ~24s when nothing decodes).
-    // Lives on the MAIN looper for the same reason playFeedback does: the sweep
-    // path tears down the camera background thread, and audio scheduled there
-    // dies with it. Stopped the moment the result is decided (emitSweepResult)
-    // so the success/fail clip plays clean, and again in stopScan as a backstop.
+    // Played as a WAV asset through MediaPlayer, exactly like the success/fail
+    // clips — a synthesized ToneGenerator blip proved inaudible on this speaker
+    // even though its AudioTrack delivered frames. Lives on the MAIN looper for
+    // the same reason playFeedback does: the sweep path tears down the camera
+    // background thread, and audio scheduled there dies with it. Stopped the
+    // moment the result is decided (emitSweepResult) so the success/fail clip
+    // plays clean, and again in stopScan as a backstop. Uses its OWN player
+    // field so a tick can never release the final clip mid-play (or vice versa).
     private static final long SCAN_BEEP_INTERVAL_MS = 900;
-    private static final int SCAN_BEEP_DURATION_MS = 80;
-    private static final int SCAN_BEEP_VOLUME = 70; // 0..100, modest so mic bleed stays low
+    private static final String SCAN_SOUND_TICK = "scan_tick.wav";
     private final Handler scanBeepHandler = new Handler(Looper.getMainLooper());
-    private android.media.ToneGenerator scanBeepTone;
+    private MediaPlayer scanTickPlayer;
     private final Runnable scanBeepTick = new Runnable() {
         @Override
         public void run() {
             if (!sweepActive) return; // result landed between ticks — stay silent
             try {
-                if (scanBeepTone != null) {
-                    scanBeepTone.startTone(
-                            android.media.ToneGenerator.TONE_PROP_BEEP, SCAN_BEEP_DURATION_MS);
+                if (scanTickPlayer != null) {
+                    try { scanTickPlayer.release(); } catch (Exception ignored) {}
+                    scanTickPlayer = null;
                 }
+                MediaPlayer mp = new MediaPlayer();
+                AssetFileDescriptor afd = getAssets().openFd(SCAN_SOUND_TICK);
+                mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+                afd.close();
+                mp.setOnCompletionListener(m -> {
+                    m.release();
+                    if (scanTickPlayer == m) scanTickPlayer = null;
+                });
+                mp.setOnErrorListener((m, what, extra) -> {
+                    m.release();
+                    if (scanTickPlayer == m) scanTickPlayer = null;
+                    return true;
+                });
+                scanTickPlayer = mp;
+                mp.prepare();
+                mp.start();
             } catch (Exception ignored) {
-                // A beep that cannot sound must never break the scan.
+                // A tick that cannot sound must never break the scan.
             }
             scanBeepHandler.postDelayed(this, SCAN_BEEP_INTERVAL_MS);
         }
@@ -259,27 +278,20 @@ public class CameraNeoService extends LifecycleService {
     private void startScanBeep() {
         scanBeepHandler.post(() -> {
             stopScanBeepLocked();
-            try {
-                scanBeepTone = new android.media.ToneGenerator(
-                        android.media.AudioManager.STREAM_MUSIC, SCAN_BEEP_VOLUME);
-            } catch (Exception e) {
-                Log.w(BarcodeScanController.TAG, "scan beep unavailable", e);
-                return;
-            }
             scanBeepHandler.post(scanBeepTick);
         });
     }
 
-    /** Stop the tick and release the tone generator. Safe to call repeatedly. */
+    /** Stop the tick and release its player. Safe to call repeatedly. */
     private void stopScanBeep() {
         scanBeepHandler.post(this::stopScanBeepLocked);
     }
 
     private void stopScanBeepLocked() {
         scanBeepHandler.removeCallbacks(scanBeepTick);
-        if (scanBeepTone != null) {
-            try { scanBeepTone.release(); } catch (Exception ignored) {}
-            scanBeepTone = null;
+        if (scanTickPlayer != null) {
+            try { scanTickPlayer.release(); } catch (Exception ignored) {}
+            scanTickPlayer = null;
         }
     }
 
