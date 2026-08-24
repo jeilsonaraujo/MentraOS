@@ -126,6 +126,11 @@ public class CameraNeoService extends LifecycleService {
     private String sweepRequestId;
     private String sweepHitValue;
     private String sweepHitFormat;
+    /** ALL codes decoded on the hit frame, as "FORMAT|value", in ML Kit order.
+     *  A frame can hold several codes (two labelled tubes side by side); the
+     *  first stays in sweepHitValue/Format for wire compatibility, the full
+     *  list rides the result as `values` and barcode.json as `codes`. */
+    private java.util.List<String> sweepHitCodes;
     private boolean sweepResultEmitted = false;
 
     /**
@@ -159,6 +164,9 @@ public class CameraNeoService extends LifecycleService {
             if (found) {
                 o.put("value", sweepHitValue);
                 o.put("format", sweepHitFormat);
+                // ALL codes from the hit frame (>= 1). Consumers that know about
+                // multi-code read this; older ones keep the single value above.
+                o.put("values", hitCodesJson());
                 // DIM-560 persistence: copy the hit frame into the camera media dir
                 // (+ barcode.json) so MediaSyncService carries it to the session.
                 promoteHitFrameToMedia();
@@ -304,6 +312,27 @@ public class CameraNeoService extends LifecycleService {
      * routes it), and the desktop reads barcode.json to store the scanned code against
      * the session. Best-effort: a failure here never breaks the live BLE result.
      */
+    /** The hit frame's codes as [{value, format}…] — falls back to the single
+     *  legacy pair so the array is never empty when a hit was recorded. */
+    private org.json.JSONArray hitCodesJson() throws org.json.JSONException {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        java.util.List<String> codes = sweepHitCodes;
+        if (codes == null || codes.isEmpty()) {
+            if (sweepHitValue != null) {
+                arr.put(new org.json.JSONObject()
+                        .put("value", sweepHitValue).put("format", sweepHitFormat));
+            }
+            return arr;
+        }
+        for (String c : codes) {
+            int bar = c.indexOf('|');
+            arr.put(new org.json.JSONObject()
+                    .put("value", bar >= 0 ? c.substring(bar + 1) : c)
+                    .put("format", bar >= 0 ? c.substring(0, bar) : "?"));
+        }
+        return arr;
+    }
+
     private void promoteHitFrameToMedia() {
         try {
             if (sweepRequestId == null || sweepHitFrame < 1 || sweepDir == null) return;
@@ -335,6 +364,9 @@ public class CameraNeoService extends LifecycleService {
             org.json.JSONObject bc = new org.json.JSONObject();
             bc.put("value", sweepHitValue);
             bc.put("format", sweepHitFormat);
+            // Every code the hit frame carried — the desktop stores one scan row
+            // per entry. Legacy single fields above stay for older readers.
+            bc.put("codes", hitCodesJson());
             bc.put("ts", System.currentTimeMillis());
             try (java.io.FileWriter w = new java.io.FileWriter(new File(dir, "barcode.json"))) {
                 w.write(bc.toString());
@@ -1420,6 +1452,7 @@ public class CameraNeoService extends LifecycleService {
         sweepRequestId = intent.getStringExtra(EXTRA_SWEEP_REQUEST_ID);
         sweepHitValue = null;
         sweepHitFormat = null;
+        sweepHitCodes = null;
         sweepResultEmitted = false;
         sweepFrameCount = 0;
         sweepHitFrame = -1;
@@ -1489,8 +1522,14 @@ public class CameraNeoService extends LifecycleService {
 
         if (found && sweepHitFrame < 0) {
             sweepHitFrame = n;
-            // Remember the first decoded code ("FORMAT|value") for the BLE result.
-            String first = raw.get(0);
+            // Keep EVERY code the hit frame decoded (deduped, ML Kit order); the
+            // first stays in the legacy single-value fields for wire compat.
+            java.util.List<String> codes = new java.util.ArrayList<>();
+            for (String r : raw) {
+                if (!codes.contains(r)) codes.add(r);
+            }
+            sweepHitCodes = codes;
+            String first = codes.get(0);
             int bar = first.indexOf('|');
             sweepHitFormat = bar >= 0 ? first.substring(0, bar) : "?";
             sweepHitValue = bar >= 0 ? first.substring(bar + 1) : first;
