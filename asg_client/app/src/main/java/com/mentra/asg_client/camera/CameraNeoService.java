@@ -59,6 +59,7 @@ import com.mentra.asg_client.settings.VideoSettings;
 import com.mentra.asg_client.utils.WakeLockManager;
 import java.io.File;
 import java.io.IOException;
+import com.mentra.asg_client.io.file.core.FileManagerFactory;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -156,6 +157,9 @@ public class CameraNeoService extends LifecycleService {
             if (found) {
                 o.put("value", sweepHitValue);
                 o.put("format", sweepHitFormat);
+                // DIM-560 persistence: copy the hit frame into the camera media dir
+                // (+ barcode.json) so MediaSyncService carries it to the session.
+                promoteHitFrameToMedia();
             }
             o.put("ts", System.currentTimeMillis());
             o.put("frames", sweepFrameCount);
@@ -220,6 +224,52 @@ public class CameraNeoService extends LifecycleService {
 
     /** Held so a feedback clip is not GC'd/torn down mid-playback (see playFeedback). */
     private MediaPlayer feedbackPlayer;
+
+    /**
+     * DIM-560 persistence: on a successful decode, copy the hit-frame JPEG out of the
+     * transient sweepDir into the camera media directory as a normal capture
+     * ({@code IMG_<ts>_<rand>_<requestId>/base.jpg}) plus a sibling {@code barcode.json}
+     * ({value, format, ts}). MediaSyncService then syncs that capture to the session
+     * over the cable at session end (the requestId's trailing {@code <sessionId>-<epoch>}
+     * routes it), and the desktop reads barcode.json to store the scanned code against
+     * the session. Best-effort: a failure here never breaks the live BLE result.
+     */
+    private void promoteHitFrameToMedia() {
+        try {
+            if (sweepRequestId == null || sweepHitFrame < 1 || sweepDir == null) return;
+            File hit = new File(
+                    sweepDir,
+                    "frame_" + String.format(Locale.US, "%02d", sweepHitFrame) + ".jpg");
+            if (!hit.exists()) {
+                Log.w(BarcodeScanController.TAG, "hit frame missing, cannot promote: " + hit);
+                return;
+            }
+            File mediaRoot = FileManagerFactory.getInstance().getDefaultMediaDirectory();
+            String ts = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date());
+            int rand = (int) (Math.random() * 1000);
+            // Same dir convention as photo/video: requestId is the LAST "_"-segment.
+            File dir = new File(mediaRoot, "IMG_" + ts + "_" + rand + "_" + sweepRequestId);
+            dir.mkdirs();
+            try (java.io.FileInputStream in = new java.io.FileInputStream(hit);
+                    java.io.FileOutputStream out =
+                            new java.io.FileOutputStream(new File(dir, "base.jpg"))) {
+                byte[] buf = new byte[8192];
+                int r;
+                while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
+            }
+            org.json.JSONObject bc = new org.json.JSONObject();
+            bc.put("value", sweepHitValue);
+            bc.put("format", sweepHitFormat);
+            bc.put("ts", System.currentTimeMillis());
+            try (java.io.FileWriter w = new java.io.FileWriter(new File(dir, "barcode.json"))) {
+                w.write(bc.toString());
+            }
+            Log.i(BarcodeScanController.TAG,
+                    "promoted hit frame + barcode.json -> " + dir.getName());
+        } catch (Exception e) {
+            Log.w(BarcodeScanController.TAG, "promote hit frame failed", e);
+        }
+    }
 
     /** Fires the still capture once (guards against the AF-monitor and the timeout racing). */
     private void fireScanStill() {
