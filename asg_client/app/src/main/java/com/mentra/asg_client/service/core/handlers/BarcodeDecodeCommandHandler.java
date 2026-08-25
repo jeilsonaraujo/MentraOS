@@ -19,7 +19,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * DIM-560 on-device barcode decode utility (diagnostics / offline evaluation). Two commands:
+ * On-device barcode decode utility (diagnostics / offline evaluation). Two commands:
  *
  * <p><b>decode_image_dir</b> — decodes every JPEG in a directory with ML Kit and logs the results,
  * for evaluating captured images off the live camera path.
