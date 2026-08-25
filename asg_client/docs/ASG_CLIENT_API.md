@@ -328,6 +328,66 @@ Response while recording:
 
 ---
 
+### Barcode scanning
+
+The handler is `BarcodeScanCommandHandler` (file: `service/core/handlers/BarcodeScanCommandHandler.java`); the sweep itself runs in `CameraNeoService`. Decoding happens **on-device** (bundled ML Kit, all formats) — only the already-decoded value crosses BLE. See [features/barcode-scanning.md](features/barcode-scanning.md) for the full pipeline.
+
+#### `start_barcode_scan`
+
+Start a bounded "sweep": up to `sweep_max` full-res stills (~1.6 s each), each decoded on-device, self-stopping at the cap or on the first decode. The glasses tick audibly while sweeping and play a success/fail tone at the end. A start while a sweep is already running is ignored.
+
+```json
+{
+  "type": "start_barcode_scan",
+  "requestId": "sess_42-1787599423695",
+  "sweep_max": 8,
+  "stop_on_found": true,
+  "af_lock": true
+}
+```
+
+| Field           | Type    | Default | Description                                                            |
+| --------------- | ------- | ------- | ---------------------------------------------------------------------- |
+| `requestId`     | string  | `scan<epoch>` | Correlates the result and names the hit-frame capture; sanitized to one path segment |
+| `sweep_max`     | number  | `35`    | Frame cap — bounds the worst-case "not found" wait (~1.6 s per frame)  |
+| `stop_on_found` | boolean | `true`  | End the sweep on the first frame that decodes anything                 |
+| `af_lock`       | boolean | `true`  | Lock autofocus after convergence for the rest of the sweep             |
+
+**Response:** one `barcode_scan_result` when the sweep ends (found, exhausted, or stopped). `values` carries **every** code on the hit frame; the top-level `value`/`format` duplicate the first one for older consumers.
+
+```json
+{
+  "type": "barcode_scan_result",
+  "found": true,
+  "value": "TUBE-A-2231",
+  "format": "QR",
+  "values": [
+    {"value": "TUBE-A-2231", "format": "QR"},
+    {"value": "TUBE-B-9911", "format": "DATA_MATRIX"}
+  ],
+  "ts": 1787601895420,
+  "frames": 2,
+  "hit_frame": 2,
+  "requestId": "sess_42-1787599423695"
+}
+```
+
+`{"type":"barcode_scan_result","found":false,"frames":8,"hit_frame":-1,"requestId":"…"}` when nothing decoded.
+
+**Side effect on success:** the hit frame is promoted into the camera media directory as a normal capture (`IMG_<ts>_<rand>_<requestId>/base.jpg`) with a `barcode.json` sidecar (`{value, format, codes: [...], ts}`), so gallery sync carries the photographic evidence off the device.
+
+Formats: `QR`, `DATA_MATRIX`, `EAN_13`, `EAN_8`, `UPC_A`, `UPC_E`, `CODE_128`, `CODE_39` (named), anything else ML Kit decodes as `FMT_<id>`.
+
+#### `stop_barcode_scan`
+
+End an in-flight sweep early. The pending `barcode_scan_result` is still emitted (with whatever was found so far).
+
+```json
+{"type": "stop_barcode_scan"}
+```
+
+---
+
 ### Streaming (RTMP / SRT / WHIP)
 
 The handler is `StreamCommandHandler` (file: `service/core/handlers/StreamCommandHandler.java`). The same four commands handle all three protocols — the protocol is detected from the URL prefix (`rtmp://` / `rtmps://`, `srt://`, `http(s)://` for WHIP).

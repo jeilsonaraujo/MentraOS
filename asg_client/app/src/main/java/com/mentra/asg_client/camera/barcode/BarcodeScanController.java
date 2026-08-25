@@ -31,13 +31,10 @@ public final class BarcodeScanController {
     /** Frames that must agree on a value before it is CONFIRMED (anti-misread on curved codes). */
     private static final int CONSENSUS_N = 2;
 
-    private String pendingValue = null;
-    private int pendingCount = 0;
+    private final CodeConsensus consensus = new CodeConsensus(CONSENSUS_N, DEDUP_WINDOW_MS);
 
     private long framesSeen = 0;
     private long decodeCount = 0;
-    private String lastValue = null;
-    private long lastValueAt = 0L;
 
     public interface ResultSink {
         void onBarcode(String value, String format);
@@ -178,7 +175,8 @@ public final class BarcodeScanController {
         return out;
     }
 
-    private static String mlkitFormatName(int fmt) {
+    /** Package-private for unit tests (pure int → name mapping). */
+    static String mlkitFormatName(int fmt) {
         switch (fmt) {
             case Barcode.FORMAT_QR_CODE: return "QR";
             case Barcode.FORMAT_EAN_13: return "EAN_13";
@@ -207,27 +205,11 @@ public final class BarcodeScanController {
                 "tentative format=" + format + " value=\"" + value + "\" (frame #" + framesSeen
                         + ", decode #" + decodeCount + ")");
 
-        if (value.equals(pendingValue)) {
-            pendingCount++;
-        } else {
-            pendingValue = value;
-            pendingCount = 1;
-        }
-
-        boolean recentlyConfirmed =
-                value.equals(lastValue) && (nowMs - lastValueAt) < DEDUP_WINDOW_MS;
-        if (pendingCount < CONSENSUS_N || recentlyConfirmed) {
-            if (recentlyConfirmed) {
-                lastValueAt = nowMs;
-            }
+        // The guard decides; this class only logs and delivers (see CodeConsensus).
+        if (!consensus.observe(value, nowMs)) {
             return null; // not yet confirmed, or a dup of a just-confirmed code
         }
 
-        // Confirmed: agreed across CONSENSUS_N frames.
-        lastValue = value;
-        lastValueAt = nowMs;
-        pendingValue = null;
-        pendingCount = 0;
         Log.i(
                 TAG,
                 "DECODED (confirmed x" + CONSENSUS_N + ") format=" + format + " value=\"" + value
@@ -251,9 +233,6 @@ public final class BarcodeScanController {
     }
 
     public void reset() {
-        lastValue = null;
-        lastValueAt = 0L;
-        pendingValue = null;
-        pendingCount = 0;
+        consensus.reset();
     }
 }
