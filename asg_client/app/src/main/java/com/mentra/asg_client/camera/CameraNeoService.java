@@ -87,13 +87,13 @@ public class CameraNeoService extends LifecycleService {
     private final CameraCoordinator cameraCoordinator = new CameraCoordinator();
     private Handler backgroundHandler;
     private String cameraId;
-    // DIM-560 barcode-scan session state (Phase 0 spike).
+    // Barcode-scan session state.
     private volatile boolean scanning = false;
     private ImageReader scanPreviewReader;
     private ImageReader scanStillReader;
     private BarcodeScanController scanController;
     private long scanStartedAt = 0L;
-    // DIM-560 spike diagnostics: dump a few preview frames to disk so we can SEE what the
+    // Scan diagnostics: dump a few preview frames to disk so we can SEE what the
     // camera captures (framing/focus/exposure) when a decode isn't happening. Capped.
     private static final boolean SCAN_DUMP_FRAMES = true;
     private static final int SCAN_DUMP_MAX = 8;
@@ -106,7 +106,7 @@ public class CameraNeoService extends LifecycleService {
     // clamped to the device's supported range at scan start. This device: [-4,+4] @ 1/2 EV.
     private int scanAeCompensation = -4;
 
-    // DIM-560 continuous sweep scan: same open-camera session, but each still is SAVED and
+    // Continuous sweep scan: same open-camera session, but each still is SAVED and
     // ML Kit-decoded on-device, per-frame results written to a session dir, and the run self-stops
     // at a frame cap or on first decode. The camera stays open across frames (no take_photo cold
     // start), so cadence is far higher than the host-driven one-photo-at-a-time loop.
@@ -122,7 +122,7 @@ public class CameraNeoService extends LifecycleService {
     // frames) before each still — capped by sweepAfMaxMs so a code the AF can't lock still shoots.
     private boolean sweepAfLock = true;
     private int sweepAfMaxMs = 1000;
-    // Result-out (DIM-560 BLE bridge): correlation id from the start command + the decoded hit.
+    // Result-out (BLE bridge): correlation id from the start command + the decoded hit.
     private String sweepRequestId;
     private String sweepHitValue;
     private String sweepHitFormat;
@@ -167,8 +167,8 @@ public class CameraNeoService extends LifecycleService {
                 // ALL codes from the hit frame (>= 1). Consumers that know about
                 // multi-code read this; older ones keep the single value above.
                 o.put("values", hitCodesJson());
-                // DIM-560 persistence: copy the hit frame into the camera media dir
-                // (+ barcode.json) so MediaSyncService carries it to the session.
+                // Persistence: copy the hit frame into the camera media dir
+                // (+ barcode.json) so the host's gallery sync carries it off-device.
                 promoteHitFrameToMedia();
             }
             o.put("ts", System.currentTimeMillis());
@@ -235,7 +235,7 @@ public class CameraNeoService extends LifecycleService {
     /** Held so a feedback clip is not GC'd/torn down mid-playback (see playFeedback). */
     private MediaPlayer feedbackPlayer;
 
-    // ── DIM-560 scan-in-progress beep ─────────────────────────────────────────
+    // ── Scan-in-progress beep ─────────────────────────────────────────
     // A soft tick every ~900ms while the sweep runs, so the wearer knows the
     // scanner is working (a sweep can take up to ~24s when nothing decodes).
     // Played as a WAV asset through MediaPlayer, exactly like the success/fail
@@ -304,13 +304,13 @@ public class CameraNeoService extends LifecycleService {
     }
 
     /**
-     * DIM-560 persistence: on a successful decode, copy the hit-frame JPEG out of the
+     * Persistence: on a successful decode, copy the hit-frame JPEG out of the
      * transient sweepDir into the camera media directory as a normal capture
      * ({@code IMG_<ts>_<rand>_<requestId>/base.jpg}) plus a sibling {@code barcode.json}
-     * ({value, format, ts}). MediaSyncService then syncs that capture to the session
-     * over the cable at session end (the requestId's trailing {@code <sessionId>-<epoch>}
-     * routes it), and the desktop reads barcode.json to store the scanned code against
-     * the session. Best-effort: a failure here never breaks the live BLE result.
+     * ({value, format, codes, ts}). The host's gallery sync then carries the capture
+     * off the device like any photo, and the caller-supplied requestId in the folder
+     * name ties it back to whatever context started the scan. Best-effort: a failure
+     * here never breaks the live BLE result.
      */
     /** The hit frame's codes as [{value, format}…] — falls back to the single
      *  legacy pair so the array is never empty when a hit was recorded. */
@@ -481,14 +481,14 @@ public class CameraNeoService extends LifecycleService {
     public static final String EXTRA_VIDEO_FILE_PATH = "com.augmentos.camera.EXTRA_VIDEO_FILE_PATH";
     public static final String EXTRA_VIDEO_ID = "com.augmentos.camera.EXTRA_VIDEO_ID";
     public static final String EXTRA_VIDEO_SETTINGS = "com.augmentos.camera.EXTRA_VIDEO_SETTINGS";
-    // DIM-560 glasses-native barcode scanner (Phase 0 spike). A preview-only scan session:
+    // Glasses-native barcode scanner. A preview-only scan session:
     // opens the camera through the same coordinator (so it can't collide with photo/video),
     // runs a continuous YUV preview, and decodes each frame on-device with ZXing.
     public static final String ACTION_START_BARCODE_SCAN =
             "com.augmentos.camera.ACTION_START_BARCODE_SCAN";
     public static final String ACTION_STOP_BARCODE_SCAN =
             "com.augmentos.camera.ACTION_STOP_BARCODE_SCAN";
-    // DIM-560 continuous sweep scan: continuous session that saves + ML Kit-decodes each still
+    // Continuous sweep scan: continuous session that saves + ML Kit-decodes each still
     // and writes per-frame results, self-stopping at a frame cap / first decode.
     public static final String ACTION_START_BARCODE_SWEEP =
             "com.augmentos.camera.ACTION_START_BARCODE_SWEEP";
@@ -1048,14 +1048,14 @@ public class CameraNeoService extends LifecycleService {
         context.startForegroundService(intent);
     }
 
-    /** DIM-560 spike: start on-glasses barcode/QR scanning (preview-only, decode on-device). */
+    /** Start on-glasses barcode/QR scanning (preview-only, decode on-device). */
     public static void startBarcodeScan(Context context) {
         Intent intent = new Intent(context, CameraNeoService.class);
         intent.setAction(ACTION_START_BARCODE_SCAN);
         context.startForegroundService(intent);
     }
 
-    /** DIM-560 spike: stop barcode scanning and release the camera. */
+    /** Stop barcode scanning and release the camera. */
     public static void stopBarcodeScan(Context context) {
         Intent intent = new Intent(context, CameraNeoService.class);
         intent.setAction(ACTION_STOP_BARCODE_SCAN);
@@ -1417,7 +1417,7 @@ public class CameraNeoService extends LifecycleService {
     }
 
     // ===================================================================================
-    // DIM-560 — barcode scan session (Phase 0 spike)
+    // Barcode scan session
     //
     // A preview-only camera session, deliberately independent of the photo/video paths:
     // its own YUV ImageReader + repeating TEMPLATE_PREVIEW request, decoded on-device by
@@ -1426,7 +1426,7 @@ public class CameraNeoService extends LifecycleService {
     // ===================================================================================
 
     /**
-     * DIM-560 continuous sweep scan: start the open-camera scan session in sweep mode — each
+     * Continuous sweep scan: start the open-camera scan session in sweep mode — each
      * still is saved + ML Kit-decoded on-device, per-frame results are written to {@code sweepDir},
      * and the run self-stops at {@code sweep_max} frames or on first decode. Reuses the whole scan
      * session; only decodeScanFrame branches on {@link #sweepActive}.

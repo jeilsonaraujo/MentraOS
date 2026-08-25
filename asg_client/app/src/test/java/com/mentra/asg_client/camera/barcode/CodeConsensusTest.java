@@ -5,7 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import org.junit.Test;
 
 /**
- * The consensus + dedup guard behind on-glasses barcode decoding (DIM-560).
+ * The consensus + dedup guard behind on-glasses barcode decoding.
  *
  * <p>The guard exists because curved 1D codes occasionally decode to a WRONG but checksum-valid
  * value — a different wrong value each frame — while a genuine code repeats. These tests pin the

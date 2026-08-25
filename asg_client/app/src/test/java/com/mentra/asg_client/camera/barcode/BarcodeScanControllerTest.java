@@ -7,9 +7,9 @@ import com.google.mlkit.vision.barcode.common.Barcode;
 import org.junit.Test;
 
 /**
- * The pure pieces of {@link BarcodeScanController} (DIM-560). The decode paths need the on-device
+ * The pure pieces of {@link BarcodeScanController}. The decode paths need the on-device
  * ML Kit runtime and real frames, so they are exercised on hardware; what CAN be pinned on the JVM
- * is the format naming every downstream consumer (BLE result, barcode.json, session_scans.format)
+ * is the format naming every downstream consumer of the BLE result and barcode.json
  * displays and stores.
  */
 public class BarcodeScanControllerTest {

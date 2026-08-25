@@ -12,7 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * On-glasses barcode/QR decode (DIM-560 glasses-native).
+ * On-glasses barcode/QR decode (glasses-native).
  *
  * <p>Uses the BUNDLED ML Kit barcode scanner — the model is statically linked into the APK, so it
  * runs fully on-device with NO Google Play Services (this glasses build is GMS-less). ML Kit was

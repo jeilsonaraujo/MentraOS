@@ -19,7 +19,7 @@ import org.robolectric.RuntimeEnvironment;
 import org.robolectric.annotation.Config;
 
 /**
- * The BLE wire contract of {@code start_barcode_scan} / {@code stop_barcode_scan} (DIM-560):
+ * The BLE wire contract of {@code start_barcode_scan} / {@code stop_barcode_scan}:
  * what JSON arriving from the phone turns into which {@link CameraNeoService} intent. This is the
  * contract a phone-side SDK (e.g. bluetooth_sdk) would program against, so it is pinned here.
  */
@@ -48,7 +48,7 @@ public class BarcodeScanCommandHandlerTest {
     public void startCommandStartsTheSweepWithTheCallersParameters() throws Exception {
         JSONObject data =
                 new JSONObject()
-                        .put("requestId", "sess-1-1787599423695")
+                        .put("requestId", "scan-1-1787599423695")
                         .put("sweep_max", 8)
                         .put("stop_on_found", true)
                         .put("af_lock", true);
@@ -60,7 +60,7 @@ public class BarcodeScanCommandHandlerTest {
         assertThat(i.getAction()).isEqualTo(CameraNeoService.ACTION_START_BARCODE_SWEEP);
         assertThat(i.getComponent().getClassName()).isEqualTo(CameraNeoService.class.getName());
         assertThat(i.getStringExtra(CameraNeoService.EXTRA_SWEEP_REQUEST_ID))
-                .isEqualTo("sess-1-1787599423695");
+                .isEqualTo("scan-1-1787599423695");
         assertThat(i.getIntExtra(CameraNeoService.EXTRA_SWEEP_MAX, -1)).isEqualTo(8);
         assertThat(i.getBooleanExtra(CameraNeoService.EXTRA_SWEEP_STOP_ON_FOUND, false)).isTrue();
         assertThat(i.getBooleanExtra(CameraNeoService.EXTRA_SWEEP_AF_LOCK, false)).isTrue();

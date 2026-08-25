@@ -339,7 +339,7 @@ Start a bounded "sweep": up to `sweep_max` full-res stills (~1.6 s each), each d
 ```json
 {
   "type": "start_barcode_scan",
-  "requestId": "sess_42-1787599423695",
+  "requestId": "scan_42-1787599423695",
   "sweep_max": 8,
   "stop_on_found": true,
   "af_lock": true
@@ -368,7 +368,7 @@ Start a bounded "sweep": up to `sweep_max` full-res stills (~1.6 s each), each d
   "ts": 1787601895420,
   "frames": 2,
   "hit_frame": 2,
-  "requestId": "sess_42-1787599423695"
+  "requestId": "scan_42-1787599423695"
 }
 ```
 

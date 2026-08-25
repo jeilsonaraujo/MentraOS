@@ -1,7 +1,7 @@
 package com.mentra.asg_client.camera.barcode;
 
 /**
- * Consensus + dedup guard for decoded barcode values (DIM-560).
+ * Consensus + dedup guard for decoded barcode values.
  *
  * <p>Curved/awkward 1D codes make decoders occasionally return a WRONG but checksum-valid value — a
  * different wrong value each frame. A genuine code decodes to the SAME value repeatedly, so a value

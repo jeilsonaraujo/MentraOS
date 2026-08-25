@@ -315,7 +315,7 @@ android {
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.jar'])
 
-    // DIM-560 glasses-native barcode/QR scanning. BUNDLED ML Kit barcode scanner: the model is
+    // Glasses-native barcode/QR scanning. BUNDLED ML Kit barcode scanner: the model is
     // statically linked into the APK, so it runs fully on-device with NO Google Play Services (this
     // glasses build is GMS-less). Validated as the best decoder for curved/soft/angled real-world
     // codes; ZXing and the Scanbot benchmark SDK were evaluated and dropped.

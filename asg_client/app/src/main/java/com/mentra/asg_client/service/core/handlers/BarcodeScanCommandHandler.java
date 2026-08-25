@@ -14,12 +14,12 @@ import java.io.File;
 import java.util.Set;
 
 /**
- * DIM-560 glasses-native barcode scanning over BLE. Starts/stops the on-device continuous "barcode
+ * Glasses-native barcode scanning over BLE. Starts/stops the on-device continuous "barcode
  * sweep" ({@link CameraNeoService}) and forwards the decoded result back over BLE.
  *
  * <p>Commands (arrive over BLE from the phone, or over adb {@code ACTION_SEND_COMMAND} for testing):
  * <pre>
- *   {"type":"start_barcode_scan","requestId":"&lt;sessionId&gt;-&lt;epoch&gt;","sweep_max":35,
+ *   {"type":"start_barcode_scan","requestId":"scan_42-1787599423695","sweep_max":35,
  *    "stop_on_found":true,"af_lock":true}
  *   {"type":"stop_barcode_scan"}
  * </pre>
