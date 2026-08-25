@@ -9,6 +9,7 @@ import android.graphics.YuvImage;
 import android.content.res.AssetFileDescriptor;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
@@ -210,6 +211,12 @@ public class CameraNeoService extends LifecycleService {
                     feedbackPlayer = null;
                 }
                 MediaPlayer mp = new MediaPlayer();
+                // The glasses route Android audio to the speaker over I2S, and the
+                // MCU only opens that path for STREAM_NOTIFICATION (see
+                // I2SAudioController and docs/ASG_CLIENT_API.md "I2S audio").
+                // Older MCU firmware let the default music stream through; newer
+                // firmware enforces the contract and silently mutes it.
+                mp.setAudioStreamType(AudioManager.STREAM_NOTIFICATION);
                 AssetFileDescriptor afd = getAssets().openFd(assetName);
                 mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
                 afd.close();
@@ -260,6 +267,9 @@ public class CameraNeoService extends LifecycleService {
                     scanTickPlayer = null;
                 }
                 MediaPlayer mp = new MediaPlayer();
+                // Same I2S routing requirement as playFeedback: only
+                // STREAM_NOTIFICATION reaches the glasses speaker.
+                mp.setAudioStreamType(AudioManager.STREAM_NOTIFICATION);
                 AssetFileDescriptor afd = getAssets().openFd(SCAN_SOUND_TICK);
                 mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
                 afd.close();
