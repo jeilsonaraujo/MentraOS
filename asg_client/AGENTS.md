@@ -184,6 +184,7 @@ asg_client/
 
 - **README.md** - Project overview and quick start
 - **docs/features/bes-ota.md** - BES OTA update system
+- **docs/features/barcode-scanning.md** - Glasses-native barcode/QR scanning (sweep engine, BLE contract, consensus guard)
 - **docs/features/camera-web-server.md** - Camera web server documentation, including the `/api/delete-files` endpoint
 - **docs/ASG_CLIENT_API.md** - ASG command surface, including audio and RGB LED commands
 - **docs/agents/PHOTO_TESTING_GUIDE.md** - Photo capture testing guide
