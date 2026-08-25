@@ -75,7 +75,7 @@ public class BarcodeDecodeCommandHandler implements ICommandHandler {
             if (bmp != null) {
                 decodedFile = true;
                 List<String> multi =
-                        new BarcodeScanController(null).decodeBitmapMlKitMultiScale(bmp, LIVE_SCALES);
+                        new BarcodeScanController(null, null).decodeBitmapMlKitMultiScale(bmp, LIVE_SCALES);
                 bmp.recycle();
                 for (String m : multi) {
                     // entries look like "scale=1280:UPC_A|071464309510"
@@ -134,7 +134,7 @@ public class BarcodeDecodeCommandHandler implements ICommandHandler {
             return;
         }
         Arrays.sort(files);
-        BarcodeScanController ctrl = new BarcodeScanController(null);
+        BarcodeScanController ctrl = new BarcodeScanController(null, null);
         Log.i(TAG, "DECODE start dir=" + dir + " files=" + files.length);
         // ML Kit downscales large inputs internally, so a code can appear only at some scales.
         int[] mlScales = new int[] {2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700};

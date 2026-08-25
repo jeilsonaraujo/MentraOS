@@ -1,5 +1,6 @@
 package com.mentra.asg_client.camera.barcode;
 
+import android.content.Context;
 import android.graphics.Bitmap;
 import android.util.Log;
 import com.google.android.gms.tasks.Tasks;
@@ -46,8 +47,23 @@ public final class BarcodeScanController {
     private final ResultSink sink;
     private final BarcodeScanner mlkit;
 
-    public BarcodeScanController(ResultSink sink) {
+    /** {@code context} may be null for diagnostics-only use; the sweep path must
+     *  pass one so ML Kit is initialized even when the manifest provider did not run. */
+    public BarcodeScanController(Context context, ResultSink sink) {
         this.sink = sink;
+        // ML Kit normally self-initializes through a manifest ContentProvider at
+        // process start, but that init has been observed NOT to run after unusual
+        // boot sequences on this device (MCU-applied power cycles), leaving
+        // getClient() throwing "MlKitContext has not been initialized". Initialize
+        // explicitly and idempotently so a scan can never depend on boot luck.
+        if (context != null) {
+            try {
+                com.google.mlkit.common.sdkinternal.MlKitContext.initializeIfNeeded(
+                        context.getApplicationContext());
+            } catch (RuntimeException e) {
+                Log.w(TAG, "MlKit explicit init failed (continuing — provider may have run)", e);
+            }
+        }
         // Bundled ML Kit scanner (all formats). Runs on-device, no GMS.
         this.mlkit =
                 BarcodeScanning.getClient(

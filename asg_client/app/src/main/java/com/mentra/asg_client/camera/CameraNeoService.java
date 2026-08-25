@@ -1620,6 +1620,7 @@ public class CameraNeoService extends LifecycleService {
 
             scanController =
                     new BarcodeScanController(
+                            this,
                             (value, format) ->
                                     // Phase 1 will forward this over BLE; Phase 0 just proves the
                                     // decode loop, so the controller already logged it.
