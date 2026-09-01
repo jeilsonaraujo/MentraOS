@@ -23,6 +23,7 @@ import com.mentra.asg_client.service.core.handlers.PhoneReadyCommandHandler;
 import com.mentra.asg_client.service.core.handlers.PhotoCommandHandler;
 import com.mentra.asg_client.service.core.handlers.PingCommandHandler;
 import com.mentra.asg_client.service.core.handlers.PowerCommandHandler;
+import com.mentra.asg_client.service.core.handlers.PublicFolderCommandHandler;
 import com.mentra.asg_client.service.core.handlers.RgbLedCommandHandler;
 import com.mentra.asg_client.service.core.handlers.ServiceHeartbeatCommandHandler;
 import com.mentra.asg_client.service.core.handlers.SettingsCommandHandler;
@@ -415,6 +416,10 @@ public class CommandProcessor {
             commandHandlerRegistry.registerHandler(
                     new GalleryModeCommandHandler(serviceManager, communicationManager));
             Log.d(TAG, "✅ Registered GalleryModeCommandHandler");
+
+            commandHandlerRegistry.registerHandler(
+                    new PublicFolderCommandHandler(serviceManager, communicationManager));
+            Log.d(TAG, "✅ Registered PublicFolderCommandHandler");
 
             commandHandlerRegistry.registerHandler(
                     new ServiceHeartbeatCommandHandler(serviceManager));

@@ -32,7 +32,26 @@ public class MediaUtils {
     public static final String VIDEOS_DIR = "videos";
     public static final String AUDIO_DIR = "audio";
     public static final String TEMP_DIR = "temp";
-    
+
+    /** Folder created under the public DCIM volume when captures are saved publicly. */
+    public static final String PUBLIC_CAPTURE_DIR = "Mentra";
+
+    /**
+     * The public directory captures are written to when {@code save_on_public_folder} is on.
+     *
+     * <p>DCIM rather than an app-scoped location, so the captures land where a gallery, a media
+     * scanner and any other app on the device already look. Writing here needs all-files access on
+     * API 30 and above; {@code FileManagerImpl} checks and falls back rather than losing a capture,
+     * so this method makes no promise that the directory is usable.
+     *
+     * @return the public capture directory, whether or not it exists yet
+     */
+    public static File getPublicCaptureDirectory() {
+        return new File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+                PUBLIC_CAPTURE_DIR);
+    }
+
     /**
      * Get the appropriate directory for a media type
      * 

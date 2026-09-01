@@ -55,6 +55,16 @@ public abstract class BaseMediaCommandHandler implements ICommandHandler {
      * @return Package directory File object, or null if failed
      */
     protected File getPackageDirectory(String packageName) {
+        // The public folder wins over any package name when it is on: a requested capture is
+        // exactly the kind another app on the device is waiting for. Checked here as well as in
+        // getDefaultMediaDirectory() because the two capture paths compose their own directories —
+        // MediaCaptureService for a button press, this one for a capture someone asked for — and
+        // redirecting only the first left requested photos in the private directory (2026-09-01).
+        File publicDir = fileManager.getPublicMediaDirectory();
+        if (publicDir != null) {
+            return publicDir;
+        }
+
         File packageDir = fileManager.getPackageDirectory(packageName);
         if (packageDir == null) {
             Log.e(TAG, "Failed to get package directory for: " + packageName);
