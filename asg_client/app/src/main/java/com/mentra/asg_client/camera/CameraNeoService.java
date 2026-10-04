@@ -328,6 +328,14 @@ public class CameraNeoService extends LifecycleService {
         return false; // Service not running or instance not set
     }
 
+    /** Whether the recorder is running right now, whatever the layers above it believe. */
+    public static boolean isVideoRecording() {
+        CameraNeoService instance = sInstance;
+        return instance != null
+                && instance.videoSession != null
+                && instance.videoSession.isRecording();
+    }
+
     /**
      * Predicts whether a photo with the given parameters would be a "warm" capture — one that
      * reuses the already-open camera/ISP instead of paying the 1–2s cold startup cost on Mentra

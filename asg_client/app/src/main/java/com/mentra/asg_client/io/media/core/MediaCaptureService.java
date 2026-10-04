@@ -536,7 +536,7 @@ public class MediaCaptureService {
                     "⚠️ StateManager not initialized - skipping battery check for video recording");
         }
 
-        if (isRecordingVideo) {
+        if (isRecordingVideo()) {
             Log.d(TAG, "Stopping video recording");
             stopVideoRecording();
         } else {
@@ -627,7 +627,7 @@ public class MediaCaptureService {
                         + maxRecordingTimeMinutes);
 
         // Check if already recording
-        if (isRecordingVideo) {
+        if (isRecordingVideo()) {
             Log.w(TAG, "Already recording video, ignoring start command");
             if (mMediaCaptureListener != null) {
                 mMediaCaptureListener.onMediaError(
@@ -659,7 +659,8 @@ public class MediaCaptureService {
     /**
      * Handle stop video recording command from phone
      *
-     * @param requestId Request ID of the video to stop (must match current recording)
+     * @param requestId Request ID the phone used for this stop; it does not have to match the
+     *     current recording, which is stopped either way
      */
     public void handleStopVideoCommand(String requestId, String webhookUrl, String authToken) {
         if (validateStopRequest(requestId)) {
@@ -679,13 +680,15 @@ public class MediaCaptureService {
     }
 
     /**
-     * Shared guard for a requestId-scoped stop: must be recording, and the requestId must match
-     * the active recording. Reports the matching media error and returns false on failure.
+     * Shared guard for a requestId-scoped stop: something must be recording. The requestId is not
+     * checked against the active recording — a stop ends whatever is recording, because the id
+     * held here can be lost while the camera keeps running, and refusing then leaves a recording
+     * nothing can stop. Reports the media error and returns false when there is nothing to stop.
      */
     private boolean validateStopRequest(String requestId) {
         Log.d(TAG, "handleStopVideoCommand called with requestId: " + requestId);
 
-        if (!isRecordingVideo) {
+        if (!isRecordingVideo()) {
             Log.w(TAG, "No video recording to stop");
             if (mMediaCaptureListener != null) {
                 mMediaCaptureListener.onMediaError(
@@ -694,14 +697,8 @@ public class MediaCaptureService {
             return false;
         }
 
-        // Verify the requestId matches current recording
         if (!requestId.equals(currentVideoId)) {
-            Log.w(TAG, "Stop command requestId doesn't match current recording");
-            if (mMediaCaptureListener != null) {
-                mMediaCaptureListener.onMediaError(
-                        requestId, "Request ID mismatch", MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
-            }
-            return false;
+            Log.w(TAG, "Stop requestId doesn't match current recording; stopping it anyway");
         }
 
         return true;
@@ -1235,7 +1232,9 @@ public class MediaCaptureService {
             // Stop battery monitoring first
             stopBatteryMonitoring();
 
-            if (!isRecordingVideo || currentVideoId == null) {
+            // Only the recorder decides. currentVideoId is not required: it has been seen null
+            // while the camera kept recording, and the camera stops without it.
+            if (!isRecordingVideo()) {
                 Log.w(TAG, "⚠️ Not currently recording, nothing to stop");
                 // No dispatch → no camera callback → nothing was registered for this stop, so
                 // there is nothing to leak (registration happens below, only on dispatch).
@@ -1349,9 +1348,16 @@ public class MediaCaptureService {
         stopVideoRecording(StopReason.USER_REQUESTED, null, null, spec);
     }
 
-    /** Check if currently recording video */
+    /**
+     * Check if currently recording video.
+     *
+     * <p>Asks the recorder, not the {@code isRecordingVideo} field: that flag and {@code
+     * currentVideoId} are written from several callback threads and have been seen to disagree
+     * with the camera, which left a recording that every stop refused and every start was refused
+     * over.
+     */
     public boolean isRecordingVideo() {
-        return isRecordingVideo;
+        return CameraNeoService.isVideoRecording();
     }
 
     /**

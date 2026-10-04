@@ -346,13 +346,12 @@ public final class VideoRecordingSession {
             }
             return;
         }
-        if (videoIdToStop == null || !videoIdToStop.equals(currentVideoId)) {
+        // A stop ends whatever is recording. The id is not a gate: the callers' copy of it can
+        // be lost while the recorder keeps running, and refusing then leaves a camera nobody can
+        // close.
+        if (videoIdToStop != null && !videoIdToStop.equals(currentVideoId)) {
             Log.w(TAG, "Stop recording requested for ID " + videoIdToStop
-                    + " but current is " + currentVideoId);
-            if (videoIdToStop != null) {
-                notifyError(videoIdToStop, "Video ID mismatch");
-            }
-            return;
+                    + " but current is " + currentVideoId + "; stopping the active recording");
         }
 
         try {
