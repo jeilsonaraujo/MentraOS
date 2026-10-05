@@ -35,6 +35,13 @@ public class FileManagerImpl implements FileManager {
     // Dependencies
     private final Logger logger;
     private final File baseDirectory;
+
+    /**
+     * Where captures go when the {@code save_on_public_folder} setting is on, or null for the
+     * private media directory. Volatile because the setting arrives on the command thread and is
+     * read on whichever thread is taking a photo.
+     */
+    private volatile File publicMediaDirectory;
     
     public FileManagerImpl(File baseDirectory, Logger logger) {
         this.baseDirectory = baseDirectory;
@@ -657,7 +664,48 @@ public class FileManagerImpl implements FileManager {
     }
 
     @Override
+    public void setPublicMediaDirectory(File directory) {
+        this.publicMediaDirectory = directory;
+        logger.info(
+                TAG,
+                directory == null
+                        ? "📂 Captures will be written to the private media directory"
+                        : "📂 Captures will be written to " + directory.getAbsolutePath());
+    }
+
+    @Override
+    public File getPublicMediaDirectory() {
+        File publicDir = publicMediaDirectory;
+        if (publicDir == null) {
+            return null;
+        }
+        if (!publicDir.exists() && !publicDir.mkdirs()) {
+            // Almost always a missing all-files-access grant: on API 30+ an app cannot create a
+            // directory under the public volume without it. Falling back keeps captures working;
+            // failing here would lose the photo the user just took.
+            logger.error(
+                    TAG,
+                    "📂 Could not create " + publicDir.getAbsolutePath()
+                            + " — falling back to the private media directory."
+                            + " Does this app hold MANAGE_EXTERNAL_STORAGE?");
+            return null;
+        }
+        if (!publicDir.canWrite()) {
+            logger.error(
+                    TAG,
+                    "📂 " + publicDir.getAbsolutePath()
+                            + " is not writable — falling back to the private media directory");
+            return null;
+        }
+        return publicDir;
+    }
+
+    @Override
     public File getDefaultMediaDirectory() {
+        File publicDir = getPublicMediaDirectory();
+        if (publicDir != null) {
+            return publicDir;
+        }
         ensurePackageDirectoryExists(getDefaultPackageName());
         return getPackageDirectory(getDefaultPackageName());
     }

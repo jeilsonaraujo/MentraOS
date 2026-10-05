@@ -10,6 +10,7 @@ import com.mentra.asg_client.io.bluetooth.interfaces.ICompanionTransport;
 import com.mentra.asg_client.io.bluetooth.managers.K900BluetoothManager;
 import com.mentra.asg_client.io.bluetooth.managers.mentralive.internal.SerialPortBridge;
 import com.mentra.asg_client.io.file.core.FileManager;
+import com.mentra.asg_client.io.media.utils.MediaUtils;
 import com.mentra.asg_client.io.media.core.MediaCaptureService;
 import com.mentra.asg_client.io.media.managers.MediaUploadQueueManager;
 import com.mentra.asg_client.io.network.core.NetworkManagerFactory;
@@ -276,6 +277,16 @@ public class AsgClientServiceManager {
             }
             if (!asgSettings.hasMfnrPreference()) {
                 asgSettings.setMfnrEnabled(true);
+            }
+
+            // The public folder preference survives reboots, so it has to be pushed back into the
+            // file manager on every start — otherwise captures silently return to the private
+            // directory after a restart and the app watching the public one goes quiet.
+            if (fileManager != null) {
+                fileManager.setPublicMediaDirectory(
+                        asgSettings.isSaveOnPublicFolder()
+                                ? MediaUtils.getPublicCaptureDirectory()
+                                : null);
             }
             Log.d(TAG, "✅ Settings initialized successfully");
         } catch (Exception e) {
@@ -670,6 +681,10 @@ public class AsgClientServiceManager {
                 "📋 getAsgSettings() called - returning: "
                         + (asgSettings != null ? "valid" : "null"));
         return asgSettings;
+    }
+
+    public FileManager getFileManager() {
+        return fileManager;
     }
 
     public INetworkManager getNetworkManager() {

@@ -21,6 +21,7 @@ public class AsgSettings {
     private static final String KEY_BUTTON_MAX_RECORDING_TIME_MINUTES = "button_max_recording_time_minutes";
     private static final String KEY_BUTTON_PHOTO_SIZE = "button_photo_size";
     private static final String KEY_SAVE_IN_GALLERY_MODE = "save_in_gallery_mode";
+    private static final String KEY_SAVE_ON_PUBLIC_FOLDER = "save_on_public_folder";
     private static final String KEY_ZSL_ENABLED = "zsl_enabled";
     private static final String KEY_MFNR_ENABLED = "mfnr_enabled";
     private static final String KEY_BUTTON_PHOTO_NOISE_REDUCTION = "button_photo_noise_reduction";
@@ -213,6 +214,33 @@ public class AsgSettings {
         Log.d(TAG, "📸 Gallery mode state changed: " + (inGalleryMode ? "ACTIVE" : "INACTIVE"));
         // Using commit() for immediate persistence
         prefs.edit().putBoolean(KEY_SAVE_IN_GALLERY_MODE, inGalleryMode).commit();
+    }
+
+    /**
+     * Whether captures are written to a public folder instead of the app's private media directory.
+     *
+     * <p>Off by default: the private directory is what the on-glasses gallery, the thumbnail
+     * manager, the orphan cleanup and the BLE transfer all read from, so moving captures out of it
+     * takes them out of those flows. It is opt-in for integrations that consume media with another
+     * app on the device rather than through the phone.
+     *
+     * @return true if captures should be written to the public folder (default: false)
+     */
+    public boolean isSaveOnPublicFolder() {
+        boolean onPublicFolder = prefs.getBoolean(KEY_SAVE_ON_PUBLIC_FOLDER, false);
+        Log.d(TAG, "Retrieved save on public folder: " + onPublicFolder);
+        return onPublicFolder;
+    }
+
+    /**
+     * Set whether captures are written to a public folder.
+     * Persisted to survive reboots, like the other capture settings.
+     *
+     * @param onPublicFolder true to write captures to the public folder
+     */
+    public void setSaveOnPublicFolder(boolean onPublicFolder) {
+        Log.d(TAG, "📂 Save on public folder changed: " + (onPublicFolder ? "PUBLIC" : "PRIVATE"));
+        prefs.edit().putBoolean(KEY_SAVE_ON_PUBLIC_FOLDER, onPublicFolder).commit();
     }
 
     /**

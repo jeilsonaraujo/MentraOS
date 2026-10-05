@@ -869,6 +869,28 @@ Toggles whether hardware-button presses save photos/videos locally (gallery mode
 
 Persisted via `AsgSettings.setSaveInGalleryMode`.
 
+#### `save_on_public_folder`
+
+Writes photos and videos to `DCIM/Mentra` instead of the app's private media directory, so another app on the same device can read them. Off by default.
+
+```json
+{"type": "save_on_public_folder", "enabled": true}
+```
+
+| Field     | Type    | Required | Description                                       |
+| --------- | ------- | -------- | ------------------------------------------------- |
+| `enabled` | boolean | no       | `true` to use the public folder (default `false`) |
+
+Response:
+
+```json
+{"type": "settings_ack", "request_id": "…", "setting": "save_on_public_folder", "status": "applied", "enabled": true, "ready": true}
+```
+
+Persisted via `AsgSettings.setSaveOnPublicFolder` and re-applied on boot. Needs `MANAGE_EXTERNAL_STORAGE`: without it the directory cannot be created on API 30+, and captures fall back to the private directory with an error in the log rather than failing.
+
+**Turning this on takes captures out of the on-glasses flows.** The gallery, the thumbnail manager, the orphan sweep and the BLE transfer all read the private directory, so a capture written to the public folder is invisible to them — and whichever app consumes the public folder becomes responsible for deleting what it takes.
+
 #### `upload_incident_logs`
 
 ```json

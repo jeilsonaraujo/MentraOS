@@ -111,6 +111,29 @@ public interface FileManager extends FileOperations, FileMetadataOperations, Pac
      * @return Default media directory
      */
     File getDefaultMediaDirectory();
+
+    /**
+     * Redirect captures to a public folder, or back to the private media directory.
+     *
+     * <p>Passing a directory makes {@link #getDefaultMediaDirectory()} return it, so captures land
+     * somewhere another app on the device can read. Passing null restores the default. The
+     * directory is only honoured while it is actually writable — see the implementation, which
+     * falls back rather than letting a capture fail.
+     *
+     * @param directory the public capture directory, or null to use the private one
+     */
+    void setPublicMediaDirectory(File directory);
+
+    /**
+     * The public capture directory, if one is set **and** currently usable.
+     *
+     * Null when the feature is off, or when the directory cannot be created or written — the caller
+     * then uses the private package directory, so a missing all-files-access grant costs the
+     * redirection and never the capture.
+     *
+     * @return the directory captures should be written to, or null for the private one
+     */
+    File getPublicMediaDirectory();
     
     /**
      * Get the thumbnail manager for video thumbnail operations.
