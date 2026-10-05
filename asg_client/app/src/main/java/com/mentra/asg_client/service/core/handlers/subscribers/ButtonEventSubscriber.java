@@ -93,8 +93,8 @@ public final class ButtonEventSubscriber implements IPeripheralBus.McuEventListe
     }
 
     /**
-     * Handle photo/video capture based on gallery mode state Only captures if camera/gallery app is
-     * currently active OR if glasses are disconnected
+     * Handle photo/video capture based on gallery mode state. Only captures if gallery mode is on;
+     * with it off, the button belongs to another app whatever the connection state
      */
     private void handlePhotoCapture(boolean isLongPress) {
         // Check if gallery/camera app is active before capturing
@@ -111,21 +111,17 @@ public final class ButtonEventSubscriber implements IPeripheralBus.McuEventListe
                         + ", Connection State: "
                         + (isConnected ? "CONNECTED" : "DISCONNECTED"));
 
-        // Skip capture only if: camera app NOT running AND phone IS connected
-        if (!isSaveInGalleryMode && isConnected) {
+        // Gallery mode off means another app owns the button, and that holds whether or not its
+        // heartbeat is current. Gating on the connection too let a restart or a lapsed heartbeat
+        // turn local capture back on under the owner, so one press became two recordings.
+        if (!isSaveInGalleryMode) {
             Log.d(
                     TAG,
-                    "📸 Camera app not active and connected to phone - skipping local capture (button press already forwarded to apps)");
+                    "📸 Gallery mode off - skipping local capture (button press already forwarded to apps)");
             return;
         }
 
-        if (!isConnected) {
-            Log.d(
-                    TAG,
-                    "📸 Disconnected from phone - proceeding with local capture regardless of gallery mode");
-        } else {
-            Log.d(TAG, "📸 Camera app active - proceeding with local capture");
-        }
+        Log.d(TAG, "📸 Gallery mode on - proceeding with local capture");
 
         MediaCaptureService captureService = serviceManager.getMediaCaptureService();
         if (captureService == null) {
