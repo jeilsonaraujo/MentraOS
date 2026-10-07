@@ -2,11 +2,15 @@ package com.mentra.asg_client.service.core.handlers;
 
 import android.util.Log;
 
+import com.mentra.asg_client.io.bluetooth.interfaces.ICompanionTransport;
+import com.mentra.asg_client.io.hardware.interfaces.IHardwareManager;
 import com.mentra.asg_client.service.legacy.interfaces.ICommandHandler;
+import com.mentra.asg_client.service.legacy.managers.AsgClientServiceManager;
 import com.mentra.asg_client.service.system.interfaces.IStateManager;
 
 import org.json.JSONObject;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
 /**
@@ -17,9 +21,16 @@ public class BatteryCommandHandler implements ICommandHandler {
     private static final String TAG = "BatteryCommandHandler";
     
     private final IStateManager stateManager;
+    private final IHardwareManager hardwareManager;
+    private final AsgClientServiceManager serviceManager;
 
-    public BatteryCommandHandler(IStateManager stateManager) {
+    public BatteryCommandHandler(
+            IStateManager stateManager,
+            IHardwareManager hardwareManager,
+            AsgClientServiceManager serviceManager) {
         this.stateManager = stateManager;
+        this.hardwareManager = hardwareManager;
+        this.serviceManager = serviceManager;
     }
 
     @Override
@@ -67,9 +78,27 @@ public class BatteryCommandHandler implements ICommandHandler {
      */
     private boolean handleRequestBatteryState() {
         try {
-            // This would typically trigger sending current battery status
-            // Implementation depends on the state manager
-            Log.d(TAG, "Requesting battery state");
+            // On the K900 a stale cache makes this query the BES (mh_batv). An answer that misses
+            // the query's short wait still arrives later as hm_batv, and BatteryEventSubscriber
+            // sends that one — so an unknown level here is not the end of the request.
+            int level = hardwareManager.getBatteryLevel();
+            if (level < 0) {
+                Log.d(TAG, "Requesting battery state - no reading yet, waiting for the BES");
+                return true;
+            }
+            boolean charging = hardwareManager.getChargingStatus();
+
+            ICompanionTransport transport = serviceManager.getBluetoothManager();
+            if (transport == null || !transport.isConnected()) {
+                Log.w(TAG, "Cannot answer battery state - transport not connected");
+                return true;
+            }
+            JSONObject status = new JSONObject();
+            status.put("type", "battery_status");
+            status.put("charging", charging);
+            status.put("percent", level);
+            transport.sendMessage(status.toString().getBytes(StandardCharsets.UTF_8));
+            Log.d(TAG, "Answered battery state: " + level + "% charging=" + charging);
             return true;
         } catch (Exception e) {
             Log.e(TAG, "Error handling request battery state command", e);

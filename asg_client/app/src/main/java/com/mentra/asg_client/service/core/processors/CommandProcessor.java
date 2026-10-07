@@ -4,6 +4,7 @@ import android.content.Context;
 import android.util.Log;
 import com.mentra.asg_client.io.bes.log.BesTracePoller;
 import com.mentra.asg_client.io.file.core.FileManager;
+import com.mentra.asg_client.io.hardware.core.HardwareManagerFactory;
 import com.mentra.asg_client.io.peripheral.IPeripheralBus;
 import com.mentra.asg_client.logging.BleTraceLogger;
 import com.mentra.asg_client.reporting.core.ReportManager;
@@ -384,7 +385,10 @@ public class CommandProcessor {
                     new WifiCommandHandler(serviceManager, communicationManager, stateManager));
             Log.d(TAG, "✅ Registered WifiCommandHandler");
 
-            commandHandlerRegistry.registerHandler(new BatteryCommandHandler(stateManager));
+            commandHandlerRegistry.registerHandler(new BatteryCommandHandler(
+                            stateManager,
+                            HardwareManagerFactory.getInstance(context),
+                            serviceManager));
             Log.d(TAG, "✅ Registered BatteryCommandHandler");
 
             commandHandlerRegistry.registerHandler(new VersionCommandHandler(serviceManager));
