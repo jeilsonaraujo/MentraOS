@@ -53,7 +53,7 @@ public final class GallerySyncFilter {
     }
 
     /**
-     * True when the capture is actively recording or awaiting post-stop integrity validation.
+     * True when the capture is actively recording.
      */
     public static boolean isCaptureBlockedFromSync(
             String fileName, String activeCaptureId, Set<String> blockedCaptureIds) {
