@@ -23,6 +23,7 @@ import java.util.concurrent.Executors;
 /** Deploys and starts the {@code com.mentra.recovery} sidecar (recovery worker APK). */
 public class RecoveryWorkerManager {
     private static final String TAG = "RecoveryWorkerManager";
+    private static final String STOCK_PACKAGE = "com.mentra.asg_client";
     private static final String RECOVERY_PACKAGE = "com.mentra.recovery";
     private static final String LEGACY_UPDATER_PACKAGE = "com.augmentos.otaupdater";
     private static final String RECOVERY_LAUNCHER_ACTIVITY = "com.mentra.recovery.ui.LauncherActivity";
@@ -48,6 +49,15 @@ public class RecoveryWorkerManager {
     }
 
     public void initialize() {
+        // The sidecar watches and reinstalls com.mentra.asg_client and nothing else. Under the
+        // .thirdparty id that package is the stock client we disabled, so waking the sidecar from
+        // here makes it ping a client that cannot answer, call it dead, and reinstall stock from
+        // /storage/emulated/0/asg/asg_client_backup.apk — which re-enables it next to us and has
+        // the two clients fighting over the buttons.
+        if (!STOCK_PACKAGE.equals(context.getPackageName())) {
+            Log.i(TAG, "Not running as the stock client; leaving the recovery worker alone");
+            return;
+        }
         registerPackageInstallReceiver();
         workerExecutor.execute(this::ensureRecoveryWorker);
     }
